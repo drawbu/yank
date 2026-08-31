@@ -1,0 +1,11 @@
+# Build
+target
+dist
+result
+
+# Config
+.direnv
+.envrc
+.env
+.idea
+.vscode
