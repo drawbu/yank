@@ -36,9 +36,26 @@ Machines
 `yank` is meant for the machines one person owns. It reads the clipboard
 through `ext-data-control-v1`, or `wlr-data-control-unstable-v1` on
 compositors that only have the older one, so it works on Sway, niri,
-Hyprland, KDE and most others, but not on GNOME or under X11. A machine
-with no graphical session can still take part: it replicates, and
-`yank copy` and `yank paste` work there.
+Hyprland, KDE and most others. There is no X11 backend. A machine with no
+graphical session can still take part: it replicates, and `yank copy` and
+`yank paste` work there.
+
+### GNOME and macOS
+
+Neither is supported yet.
+
+GNOME implements neither data-control protocol, and the [clipboard
+portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Clipboard.html)
+extends remote-desktop sessions rather than standing on its own, so there
+is currently no interface a clipboard manager can use. These protocols let
+any client read every clipboard change without asking, which is a fair
+thing to weigh against; see [mutter#524](https://gitlab.gnome.org/GNOME/mutter/-/issues/524).
+Reaching GNOME would mean a Shell extension rather than another Wayland
+backend.
+
+macOS is possible and simply not written, the project is still brand new.
+I do not own a macOS machine, but I do not object to write support some day if
+there is some demand.
 
 ## Installation
 
