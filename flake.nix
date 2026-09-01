@@ -28,10 +28,7 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
 
-            # The tests bring up two daemons and pair them over hermetic
-            # iroh endpoints, which needs more of a network than the build
-            # sandbox has.
-            doCheck = false;
+            useNextest = true;
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
             postInstall = ''
@@ -79,6 +76,7 @@
             inputsFrom = [ self.packages.${system}.yank ];
             env.RUSTUP_TOOLCHAIN = pkgs.rustc.version;
             packages = with pkgs; [
+              cargo-nextest
               rustup
               wl-clipboard
             ];
