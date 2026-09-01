@@ -9,3 +9,6 @@ result
 .env
 .idea
 .vscode
+
+# Local scratch, not for upstream
+local

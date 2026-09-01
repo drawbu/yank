@@ -1,24 +1,45 @@
 [package]
-name = "hyprqtile"
+name = "yank"
+version = "0.1.0"
 edition = "2024"
+description = "Peer-to-peer clipboard sharing across your machines"
+license = "WTFPL"
 
 [dependencies]
+anstream = "1.0"
+anstyle = "1.0"
+blake3 = "1.8"
+bytesize = { version = "2.7", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+color-eyre = "0.6"
+data-encoding = "2.11"
 etcetera = "0.11"
-gethostname = "1.0"
-console = "0.16"
-indicatif = "0.18"
-iroh = "1.0"
-notify = "7.0"
-pollster = "1.0"
+humantime = "2.4"
+iroh = "1.1"
 postcard = { version = "1.1", features = ["use-std"] }
-prost = "0.14"
 rand = "0.10"
+rustix = { version = "1.1", features = ["event", "pipe", "system"] }
 serde = { version = "1.0", features = ["derive"] }
-service-manager = "0.11"
+serde_json = "1.0"
 subtle = { version = "2.6", default-features = false }
-tempfile = "3.27"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zstd = "0.13"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zeroize = "1.9"
+
+[features]
+# Hermetic endpoints and helpers used by the integration tests.
+test-util = []
+
+[dev-dependencies]
+tempfile = "3"
+yank = { path = ".", features = ["test-util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
