@@ -8,5 +8,6 @@
 
 pub mod clip;
 pub mod config;
+pub mod daemon;
 pub mod log;
 pub mod net;
