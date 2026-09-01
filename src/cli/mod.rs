@@ -22,10 +22,11 @@ use color_eyre::eyre::Result;
 
 use crate::config::Dirs;
 
-/// One clipboard, across your machines
+/// A peer-to-peer clipboard daemon
 ///
-/// Machines pair once and then connect straight to each other, with no
-/// server in between. What one copies, the others can paste.
+/// Replicates the clipboard, and a bounded history of it, across the
+/// machines you own. They pair once and connect directly from then on,
+/// with no server in between.
 ///
 /// Getting started:
 ///   1. Install the background service:  yank service install

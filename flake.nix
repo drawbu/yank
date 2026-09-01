@@ -1,5 +1,5 @@
 {
-  description = "yank: one clipboard, shared across your machines";
+  description = "yank: a peer-to-peer clipboard daemon";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -42,7 +42,7 @@
             '';
 
             meta = {
-              description = "One clipboard, shared across your machines";
+              description = "Peer-to-peer clipboard daemon";
               license = nixpkgs.lib.licenses.wtfpl;
               mainProgram = "yank";
               platforms = nixpkgs.lib.platforms.linux;
