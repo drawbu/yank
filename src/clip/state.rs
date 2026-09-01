@@ -1062,6 +1062,55 @@ mod tests {
         assert!(board.history().is_empty());
     }
 
+    /// The one property a later version of yank depends on: an event this
+    /// build cannot read is carried anyway.
+    ///
+    /// It is what makes adding an event variant a change one machine can
+    /// make on its own. It is deliberately *not* written to disk, since a
+    /// payload we cannot read is one we cannot know is a secret; the
+    /// watermark is rebuilt from the disk on start, so a machine that
+    /// restarts simply asks for it again.
+    #[test]
+    fn an_event_from_a_newer_version_is_carried_but_not_stored() {
+        let origin = iroh::SecretKey::generate().public();
+        let mut board = clipboard();
+        // A variant number no version of this enum has.
+        let from_the_future = WireEntry {
+            id: EntryId { origin, seq: 1 },
+            clock: Hlc {
+                millis: 1,
+                counter: 0,
+            },
+            payload: vec![99],
+        };
+
+        let effects = board.accept(vec![from_the_future]).unwrap();
+
+        assert!(board.history().is_empty(), "it means nothing to this build");
+        assert_eq!(
+            board.since(&Watermark::default()).len(),
+            1,
+            "but a peer that understands it must still be able to get it",
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Store(_))),
+            "a payload we cannot read is one we cannot know is safe to keep",
+        );
+        assert_eq!(
+            board.have().get(&origin),
+            1,
+            "and it is not asked for twice"
+        );
+
+        // Restarting rebuilds the watermark from what is on disk, so the
+        // entry comes back around instead of being lost for good.
+        let mut restarted = clipboard();
+        restarted.restore(Vec::new());
+        assert_eq!(restarted.have(), Watermark::default());
+    }
+
     #[test]
     fn a_secret_never_goes_to_disk_and_is_never_shown() {
         let mut board = clipboard();

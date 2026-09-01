@@ -7,6 +7,12 @@
 //!
 //! The daemon side that ties them together lives in
 //! [`crate::daemon::clip`].
+//!
+//! [`wayland`] is the only backend there is, but it is not the only one
+//! there could be: what the rest of the clipboard sees of it is
+//! [`wayland::Command`], [`wayland::Event`] and [`wayland::Captured`], and
+//! nothing more. Another platform means another module answering to those
+//! three, and the mime policy in [`mime`] applying to what it produces.
 
 pub mod event;
 pub mod mime;

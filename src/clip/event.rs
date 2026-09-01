@@ -36,6 +36,13 @@ pub enum Event {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Copy {
     /// The mime type `bytes` is in.
+    ///
+    /// Mime is the vocabulary of the mesh, on every platform. A backend
+    /// for a system that names its own types differently, macOS and its
+    /// uniform type identifiers for instance, translates at its own edge
+    /// rather than putting a second vocabulary on the wire: two machines
+    /// naming the same bytes differently would each have to understand
+    /// both, forever.
     pub mime: String,
     pub bytes: Vec<u8>,
     /// Whether this is a password or the like: never written to disk,
