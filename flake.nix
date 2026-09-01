@@ -3,29 +3,56 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    flake-parts.inputs.nixpkgs-lib.follows = "nixpkgs";
   };
 
   outputs =
-    { self, nixpkgs, ... }:
-    let
-      # Linux only: yank reads the clipboard through the Wayland
-      # data-control protocols, which is all it knows how to do.
-      forEachSystem = nixpkgs.lib.genAttrs [
+    inputs@{ self, flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
-    in
-    {
-      packages = forEachSystem (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
 
-          yank = pkgs.rustPlatform.buildRustPackage {
+      flake = {
+        overlays.default = final: prev: {
+          inherit (self.packages.${final.stdenv.hostPlatform.system}) yank;
+        };
+
+        homeModules = rec {
+          yank = import ./nix/home-module.nix self;
+          default = yank;
+        };
+
+        nixosModules = rec {
+          yank = import ./nix/nixos-module.nix self;
+          default = yank;
+        };
+      };
+
+      perSystem =
+        {
+          lib,
+          pkgs,
+          self',
+          ...
+        }:
+        {
+          packages.default = self'.packages.yank;
+          packages.yank = pkgs.rustPlatform.buildRustPackage {
             pname = "yank";
-            version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
+            version = (lib.importTOML ./Cargo.toml).package.version;
 
-            src = self;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./src
+                ./tests
+              ];
+            };
             cargoLock.lockFile = ./Cargo.lock;
 
             useNextest = true;
@@ -40,50 +67,21 @@
 
             meta = {
               description = "Peer-to-peer clipboard daemon";
-              license = nixpkgs.lib.licenses.wtfpl;
+              license = lib.licenses.wtfpl;
               mainProgram = "yank";
-              platforms = nixpkgs.lib.platforms.linux;
+              platforms = lib.platforms.linux;
             };
           };
-        in
-        {
-          default = yank;
-          inherit yank;
-        }
-      );
 
-      overlays.default = final: prev: {
-        inherit (self.packages.${final.stdenv.hostPlatform.system}) yank;
-      };
-
-      homeModules = rec {
-        yank = import ./nix/home-module.nix self;
-        default = yank;
-      };
-
-      nixosModules = rec {
-        yank = import ./nix/nixos-module.nix self;
-        default = yank;
-      };
-
-      devShells = forEachSystem (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.mkShell {
-            inputsFrom = [ self.packages.${system}.yank ];
-            env.RUSTUP_TOOLCHAIN = pkgs.rustc.version;
+          devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               cargo-nextest
               rustup
               wl-clipboard
             ];
           };
-        }
-      );
 
-      formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
+          formatter = pkgs.nixfmt-tree;
+        };
     };
 }
