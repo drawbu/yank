@@ -385,10 +385,10 @@ impl State {
                     secret,
                 });
             }
-            DeviceEvent::Selection(None) => {
-                self.forget_stale_offers();
-                let _ = self.events.send(Event::Emptied);
-            }
+            // Nobody owns the selection now, which is not something the
+            // daemon acts on: an empty clipboard is not a reason to put an
+            // entry back on it (see [`crate::clip::state`]).
+            DeviceEvent::Selection(None) => self.forget_stale_offers(),
             DeviceEvent::Finished => self.alive = false,
         }
     }

@@ -157,12 +157,6 @@ impl ClipService {
             Ok(effects) => self.perform(effects),
             Err(err) => warn!("cannot record the selection: {err:#}"),
         }
-
-        // Whatever the compositor holds is now accounted for, so an entry
-        // the mesh chose while we were down can be applied without
-        // overwriting a newer local one.
-        let effects = self.board.lock().unwrap().settle();
-        self.perform(effects);
     }
 
     /// Makes an entry already in the history the selection again.
@@ -403,10 +397,6 @@ impl ClipService {
         *self.down.lock().unwrap() = None;
         info!("clipboard connected");
 
-        // The compositor reports what it holds as soon as it can, and that
-        // report decides whether the mesh's selection is applied here (see
-        // `Clipboard::captured`). Settling now, before it arrives, would
-        // overwrite a selection the user made while the daemon was down.
         Ok(())
     }
 
@@ -416,18 +406,6 @@ impl ClipService {
         match event {
             backend::Event::Copied(captured) => {
                 self.record(captured);
-                false
-            }
-            backend::Event::Emptied => {
-                // Somebody emptied the clipboard here. It is not shared:
-                // applications empty it when they exit, and wiping every
-                // machine for that would be worse than doing nothing.
-                let mut board = self.board.lock().unwrap();
-                board.emptied();
-                let effects = board.settle();
-                drop(board);
-
-                self.perform(effects);
                 false
             }
             backend::Event::Lost(reason) => {

@@ -16,6 +16,15 @@
 //! the same state, so there is no reconciliation step and nothing to
 //! resolve when a machine comes back.
 //!
+//! An entry reaches the local clipboard once, when it becomes the
+//! selection, and nothing puts it back afterwards. An application that
+//! takes the selection and exits leaves this clipboard empty, the way any
+//! Wayland clipboard is left empty; the entry is still in the history, and
+//! `yank pick` is what asks for it again. Re-asserting it would mean
+//! racing the application that took the selection, and the request sent
+//! last is the one the compositor keeps, so what the race costs is
+//! whatever the user copied a moment ago.
+//!
 //! No I/O happens here. Mutations return [`Effect`]s and the caller
 //! performs them, which is what lets the whole thing be tested without a
 //! compositor, a disk or a peer.
@@ -122,8 +131,9 @@ pub struct Clipboard {
     purged_through: Hlc,
     /// Nothing written at or before this point can be the selection.
     cleared_through: Hlc,
-    /// What we last put on the local clipboard, so we neither re-apply it
-    /// nor mistake it for something the user copied.
+    /// The entry we last put on the local clipboard, whether or not it is
+    /// still there, so we neither put it on again nor mistake it for
+    /// something the user copied.
     applied: Option<EntryId>,
     pause: Pause,
 }
@@ -356,8 +366,8 @@ impl Clipboard {
     /// good, invisible to `yank list` and out of reach of
     /// `yank clear --history`.
     ///
-    /// Nothing reaches the clipboard here: [`Self::settle`] does that once
-    /// the compositor has said what it already holds.
+    /// Nothing reaches the clipboard here, and nothing ever will for what
+    /// was read back: those entries have had their turn on it.
     pub fn restore(&mut self, entries: Vec<WireEntry>) -> Vec<Effect> {
         let restored: Vec<EntryId> = entries.iter().map(|wire| wire.id).collect();
 
@@ -371,30 +381,16 @@ impl Clipboard {
         // the changes, since an entry the caps drop the moment it lands is
         // reported as never having landed at all.
         let _ = self.fold(changes);
+        // A restart is not a reason to put an entry on the clipboard. What
+        // the session holds is the compositor's to report, and it may be
+        // something the user copied while the daemon was down.
+        self.applied = self.selection().map(|item| item.id);
 
         restored
             .into_iter()
             .filter(|id| self.log.get(*id).is_none())
             .map(Effect::Forget)
             .collect()
-    }
-
-    /// Brings the clipboard in line with the history: after a restore,
-    /// after a pause is lifted, and once the compositor has said what it
-    /// holds.
-    pub fn settle(&mut self) -> Vec<Effect> {
-        self.reconcile()
-    }
-
-    /// Records that the local clipboard was emptied by somebody else.
-    ///
-    /// It is not shared with the other machines: applications empty the
-    /// clipboard when they exit, and wiping every machine for that would
-    /// be worse than doing nothing. All it does is forget that our
-    /// selection is on the clipboard, so it can be put back the next time
-    /// there is a reason to.
-    pub fn emptied(&mut self) {
-        self.applied = None;
     }
 
     /// Makes an entry already in the history the selection again, by
@@ -870,6 +866,38 @@ mod tests {
         // the application that owns it would gain nothing.
         assert!(applied(&effects).is_empty());
         assert_eq!(previews(&board), vec!["typed elsewhere"]);
+    }
+
+    /// A restart is not one either. What it would put on the clipboard is
+    /// whatever was copied last before it, and it would take the selection
+    /// from the application that owns it now.
+    #[test]
+    fn a_restored_history_is_not_put_back_on_the_clipboard() {
+        let mut board = clipboard();
+        copy(&mut board, "before the restart");
+
+        let mut restarted = clipboard();
+        let effects = restarted.restore(wire(&board));
+        assert!(applied(&effects).is_empty());
+        // Including on every reconciliation that follows: the service loop
+        // runs one whenever it wakes to expire entries.
+        assert!(applied(&restarted.expire(SystemTime::now())).is_empty());
+        assert_eq!(restarted.selection().unwrap().preview, "before the restart");
+    }
+
+    /// What lands *after* the restart is a reason, or a machine coming
+    /// back would never take the clipboard the mesh moved on to.
+    #[test]
+    fn an_entry_arriving_after_a_restart_still_reaches_the_clipboard() {
+        let mut board = clipboard();
+        copy(&mut board, "before the restart");
+        let mut restarted = clipboard();
+        restarted.restore(wire(&board));
+
+        copy(&mut board, "copied elsewhere since");
+        let effects = restarted.accept(peer_fetch(&board, &restarted)).unwrap();
+
+        assert_eq!(applied(&effects), vec!["copied elsewhere since"]);
     }
 
     #[test]

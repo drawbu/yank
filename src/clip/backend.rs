@@ -7,8 +7,7 @@
 //! ```text
 //!   state ──► Command ──►  backend  ──► Event ──► state
 //!             Offer(Serve)             Copied(Captured)
-//!             Clear                    Emptied
-//!                                      Lost
+//!             Clear                    Lost
 //! ```
 //!
 //! Three properties are what make a platform implementable, and every one
@@ -49,8 +48,6 @@ pub enum Command {
 pub enum Event {
     /// Something was copied by an application other than us.
     Copied(Captured),
-    /// The selection was emptied by somebody else.
-    Emptied,
     /// The backend is gone: the session ended, or withdrew what the
     /// backend was using. The daemon reconnects.
     Lost(String),
