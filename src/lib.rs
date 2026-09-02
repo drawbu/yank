@@ -28,6 +28,9 @@
 //! - [`clip`] is the clipboard topic: the entry model (mime types,
 //!   lifetimes, secrecy), the Wayland data-control backend, and the state
 //!   machine tying them to the log.
+//! - [`files`] is what a copied *file* means across machines: the log
+//!   carries the manifest, and the bytes are spooled here and pulled from
+//!   whoever has them.
 //! - [`daemon`] runs it all: peer connections, routing, the control socket
 //!   the CLI talks to.
 //! - [`cli`] is the `yank` command itself.
@@ -46,5 +49,6 @@ pub mod cli;
 pub mod clip;
 pub mod config;
 pub mod daemon;
+pub mod files;
 pub mod log;
 pub mod net;

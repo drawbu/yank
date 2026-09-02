@@ -2722,6 +2722,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reflink-copy"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "rustix",
+ "windows",
+]
+
+[[package]]
 name = "regex-automata"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4370,8 +4382,10 @@ dependencies = [
  "etcetera",
  "humantime",
  "iroh",
+ "percent-encoding",
  "postcard",
  "rand",
+ "reflink-copy",
  "rustix",
  "serde",
  "serde_json",
@@ -4381,6 +4395,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",

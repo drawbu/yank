@@ -53,9 +53,26 @@ const TEMPLATE: &str = r#"# yank configuration
 
 # Mime types to never capture, on top of the ones yank already refuses.
 #ignore-mime = []
+
+# Whether copying files copies the files themselves. Turned off, a file
+# copied here reaches the other machines as the text of its path, which is
+# a path they do not have.
+#files = true
+
+# Largest file copy that gets shared, every file of it together. A copy
+# over it is shared as text.
+#max-file-size = "1 GiB"
+
+# Total size the spooled files may occupy, on top of the history.
+#file-budget = "8 GiB"
 "#;
 
 /// The parsed `config.toml`.
+///
+/// Every switch here is a direction something may or may not go in, and
+/// they are independent of each other; there is no state machine hiding
+/// behind them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
@@ -86,6 +103,13 @@ pub struct Settings {
     /// marking the entry secret rather than by dropping it (see
     /// [`crate::clip`]), so it is not listed here.
     pub ignore_mime: Vec<String>,
+    /// Whether a copied file is shared as its contents rather than as the
+    /// text of its path.
+    pub files: bool,
+    /// Largest file copy shared, every file of it together.
+    pub max_file_size: ByteSize,
+    /// Total size the spooled files may occupy.
+    pub file_budget: ByteSize,
 }
 
 impl Default for Settings {
@@ -99,6 +123,9 @@ impl Default for Settings {
             history_budget: ByteSize::mib(64),
             secret_ttl: Duration::from_secs(90),
             ignore_mime: Vec::new(),
+            files: true,
+            max_file_size: ByteSize::gib(1),
+            file_budget: ByteSize::gib(8),
         }
     }
 }
@@ -154,6 +181,11 @@ impl Settings {
         usize::try_from(self.max_entry_size.as_u64())
             .unwrap_or(usize::MAX)
             .min(crate::log::MAX_ENTRY_BYTES as usize)
+    }
+
+    /// The file cap as a plain number, for comparisons against a manifest.
+    pub fn max_file_bytes(&self) -> u64 {
+        self.max_file_size.as_u64()
     }
 }
 

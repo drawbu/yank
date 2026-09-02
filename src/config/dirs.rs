@@ -108,6 +108,12 @@ impl Dirs {
         self.state.join("history")
     }
 
+    /// The spool of copied files: content by hash, and the trees entries
+    /// are laid out in.
+    pub fn files_dir(&self) -> PathBuf {
+        self.state.join("files")
+    }
+
     /// The control socket the CLI dials.
     pub fn socket_file(&self) -> PathBuf {
         match &self.runtime {
