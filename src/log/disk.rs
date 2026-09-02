@@ -16,7 +16,8 @@ use std::{
     thread,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::{Entry, EntryId, WireEntry};
@@ -25,6 +26,16 @@ use crate::config::write_private;
 /// Extension of a persisted entry, also the filter used when reading the
 /// directory back.
 const EXTENSION: &str = "entry";
+
+/// Schema of the files in this directory. A missing marker is the pre-schema
+/// history, which this version intentionally discards.
+const VERSION: u32 = 1;
+const META: &str = "meta.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Meta {
+    version: u32,
+}
 
 /// The disk side of the log.
 ///
@@ -47,7 +58,7 @@ enum Op {
 impl Writer {
     /// Starts the writer for `dir`, creating the directory if needed.
     pub fn spawn(dir: PathBuf) -> Result<Self> {
-        crate::config::create_private(&dir)?;
+        prepare(&dir)?;
 
         let (queue, ops) = mpsc::channel();
         let thread = thread::Builder::new()
@@ -64,6 +75,7 @@ impl Writer {
 
     /// Reads back every entry in `dir`, discarding the unreadable ones.
     pub fn load(dir: &Path) -> Result<Vec<WireEntry>> {
+        prepare(dir)?;
         let listing = match fs::read_dir(dir) {
             Ok(listing) => listing,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -122,6 +134,42 @@ impl Writer {
             warn!("the history writer stopped; entries are no longer persisted");
         }
     }
+}
+
+/// Makes the history directory match this build's schema.
+fn prepare(dir: &Path) -> Result<()> {
+    let meta = dir.join(META);
+    match fs::read(&meta) {
+        Ok(bytes) => {
+            let meta: Meta = serde_json::from_slice(&bytes)
+                .wrap_err_with(|| format!("cannot read {}", meta.display()))?;
+            ensure!(
+                meta.version == VERSION,
+                "history schema {} is newer than this yank",
+                meta.version,
+            );
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound && dir.exists() => {
+            // Version zero had no schema marker. It cannot be decoded after
+            // the Copy payload changed, so start this one cleanly.
+            fs::remove_dir_all(dir).wrap_err_with(|| format!("cannot clear {}", dir.display()))?;
+            crate::config::create_private(dir)?;
+            crate::config::write_private(
+                &meta,
+                &serde_json::to_vec_pretty(&Meta { version: VERSION })?,
+            )?;
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            crate::config::create_private(dir)?;
+            crate::config::write_private(
+                &meta,
+                &serde_json::to_vec_pretty(&Meta { version: VERSION })?,
+            )?;
+        }
+        Err(err) => return Err(err).wrap_err_with(|| format!("cannot read {}", meta.display())),
+    }
+
+    Ok(())
 }
 
 impl Drop for Writer {
@@ -221,5 +269,18 @@ mod tests {
 
         assert!(Writer::load(&path).unwrap().is_empty());
         assert!(!path.join("broken.entry").exists());
+    }
+
+    #[test]
+    fn a_history_without_a_schema_marker_is_started_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("old.entry"), b"old").unwrap();
+
+        assert!(Writer::load(&path).unwrap().is_empty());
+        let meta: Meta = serde_json::from_slice(&fs::read(path.join(META)).unwrap()).unwrap();
+        assert_eq!(meta.version, VERSION);
+        assert!(!path.join("old.entry").exists());
     }
 }

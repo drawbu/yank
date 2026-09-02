@@ -6,6 +6,11 @@
 //! other about it; [`mime`] is the policy for which representations of a
 //! selection to carry.
 //!
+//! An entry may also *name* files rather than carry them, which is what
+//! copying a file is; [`crate::files`] is what those names mean, and the
+//! state machine asks for the contents with [`Effect::Fetch`] rather than
+//! going anywhere near a disk.
+//!
 //! The daemon side that ties them together lives in
 //! [`crate::daemon::clip`].
 //!

@@ -6,10 +6,16 @@
 //! so they reach a machine that was offline when they happened instead of
 //! being forgotten the moment the network was down.
 
+use std::path::PathBuf;
+
 use color_eyre::eyre::{Result, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
-use crate::log::{EntryId, Payload, payload};
+use super::mime;
+use crate::{
+    files::{self, FileRef},
+    log::{EntryId, Payload, payload},
+};
 
 /// One clipboard event.
 ///
@@ -43,6 +49,12 @@ pub struct Copy {
     /// the clipboard, empties the clipboard. `None` lets it live until the
     /// history limits push it out.
     pub ttl: Option<u32>,
+    /// The files this selection names, empty when it names none.
+    ///
+    /// A file copy is a copy of paths (see [`crate::files`]), so this is
+    /// what the paths in the selection mean: the contents, by hash, for a
+    /// machine that does not have that filesystem to resolve them against.
+    pub files: Vec<FileRef>,
 }
 
 /// A selection, in every type it is carried under.
@@ -98,6 +110,33 @@ impl Selection {
         }
     }
 
+    /// A selection naming files where they are on this machine.
+    ///
+    /// Three types, because pasting a file means three things: a file
+    /// manager reads the URIs, GNOME's reads what to do with them first,
+    /// and a terminal reads the paths as text. Built from the paths rather
+    /// than carried across, since only the machine holding the files knows
+    /// where they are.
+    pub fn of_files(paths: &[PathBuf]) -> Self {
+        Selection {
+            primary: Rep::new(mime::PLAIN_TEXT, files::as_text(paths)),
+            alternates: vec![
+                Rep::new(mime::URI_LIST, files::uri_list(paths)),
+                Rep::new(mime::GNOME_COPIED_FILES, files::gnome_copied_files(paths)),
+            ],
+        }
+    }
+
+    /// The local paths this selection names, empty when it names none.
+    ///
+    /// The other half of [`Self::of_files`]: what a file manager puts on
+    /// the clipboard is read back the same way it is written.
+    pub fn file_paths(&self) -> Vec<PathBuf> {
+        self.rep(mime::URI_LIST)
+            .map(|rep| files::paths(&rep.bytes))
+            .unwrap_or_default()
+    }
+
     /// The type that describes the selection.
     pub fn mime(&self) -> &str {
         &self.primary.mime
@@ -121,6 +160,13 @@ impl Selection {
     /// The representation offered under `mime`.
     pub fn rep(&self, mime: &str) -> Option<&Rep> {
         self.reps().find(|rep| rep.mime.eq_ignore_ascii_case(mime))
+    }
+}
+
+impl Copy {
+    /// Whether the selection names files rather than carrying bytes.
+    pub fn is_files(&self) -> bool {
+        !self.files.is_empty()
     }
 }
 
@@ -160,6 +206,7 @@ mod tests {
             .unwrap(),
             secret: true,
             ttl: Some(90),
+            files: Vec::new(),
         });
 
         let decoded = Event::decode(&event.encode()).unwrap();

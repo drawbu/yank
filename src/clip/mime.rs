@@ -37,6 +37,10 @@ const MAX_REPS: usize = 8;
 /// The type a file reference is carried as: `file://` URIs, one per line.
 pub const URI_LIST: &str = "text/uri-list";
 
+/// What GNOME's file managers paste from: what to do with the files, then
+/// the URIs.
+pub const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
+
 /// Text types, best first. The first is what wl-clipboard and every
 /// Wayland toolkit prefer; the rest are the X11 names that survive in
 /// applications ported from it.
@@ -51,7 +55,7 @@ const TEXT: &[&str] = &[PLAIN_TEXT, "text/plain", "UTF8_STRING", "STRING", "TEXT
 /// these are only ever offered back where they came from.
 const LOCAL: &[&str] = &[
     URI_LIST,
-    "x-special/gnome-copied-files",
+    GNOME_COPIED_FILES,
     "x-special/nautilus-clipboard",
     "application/x-kde-cutselection",
 ];

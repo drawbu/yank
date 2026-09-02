@@ -31,6 +31,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -45,6 +46,7 @@ use super::{
 };
 use crate::{
     config::Settings,
+    files::{self, FileRef, Hash},
     log::{Change, Entry, EntryId, Hlc, Limits, Log, Watermark, WireEntry, payload},
     net::proto,
 };
@@ -63,6 +65,9 @@ pub enum Effect {
     Apply(Vec<Serve>),
     /// Empty the local clipboard.
     ClearSelection,
+    /// Bring the files this entry names onto this machine, from whoever
+    /// has them. Until they are here it is on the clipboard as text.
+    Fetch(EntryId),
 }
 
 /// One entry as the history shows it. The bytes stay in the log; this is
@@ -73,7 +78,8 @@ pub struct Item {
     pub clock: Hlc,
     /// The type the entry is named by; the rest are in the log.
     pub mime: String,
-    /// What the entry weighs: every representation together.
+    /// What the entry weighs: every representation, and the files it
+    /// names.
     pub size: usize,
     pub secret: bool,
     /// When this entry disappears everywhere, if it was given a lifetime.
@@ -81,6 +87,10 @@ pub struct Item {
     /// One line describing the contents; `<secret>` when it must not be
     /// shown.
     pub preview: String,
+    /// The files the entry names, empty when it names none. Shared rather
+    /// than owned: a manifest runs to thousands of files, and `yank list`
+    /// has no use for one beyond its length.
+    pub files: Arc<[FileRef]>,
     /// Hash of the copied bytes, to recognize the same content coming back
     /// from the compositor.
     hash: [u8; 32],
@@ -135,6 +145,10 @@ pub struct Clipboard {
     /// still there, so we neither put it on again nor mistake it for
     /// something the user copied.
     applied: Option<EntryId>,
+    /// Entries whose files are on this machine, and where they were laid
+    /// out. Until an entry is in here its paths are another machine's, and
+    /// are offered as text rather than as files.
+    ready: BTreeMap<EntryId, PathBuf>,
     pause: Pause,
 }
 
@@ -149,6 +163,7 @@ impl Clipboard {
             purged_through: Hlc::default(),
             cleared_through: Hlc::default(),
             applied: None,
+            ready: BTreeMap::new(),
             pause,
         }
     }
@@ -258,10 +273,12 @@ impl Clipboard {
     pub fn copy(
         &mut self,
         selection: Selection,
+        files: Vec<FileRef>,
         secret: bool,
         ttl: Option<Duration>,
     ) -> Result<(EntryId, Vec<Effect>)> {
         let size = selection.size();
+        files::validate(&files)?;
         ensure!(size > 0, "nothing to copy");
         ensure!(
             size <= self.settings.max_entry_bytes(),
@@ -273,6 +290,7 @@ impl Clipboard {
             selection,
             secret,
             ttl: self.lifetime(secret, ttl),
+            files,
         });
         let (id, changes) = self.log.append(event.encode(), !secret)?;
 
@@ -284,7 +302,7 @@ impl Clipboard {
     /// The bytes are already on the clipboard, so the new entry is marked
     /// as applied: putting them back would take the selection away from
     /// the application that owns it, for nothing.
-    pub fn captured(&mut self, captured: Captured) -> Result<Vec<Effect>> {
+    pub fn captured(&mut self, captured: Captured, files: Vec<FileRef>) -> Result<Vec<Effect>> {
         if !self.pause.capture.is_on(SystemTime::now()) {
             return Ok(Vec::new());
         }
@@ -311,6 +329,7 @@ impl Clipboard {
             selection,
             secret: captured.secret,
             ttl: self.lifetime(captured.secret, None),
+            files,
         });
         let (id, changes) = self.log.append(event.encode(), !captured.secret)?;
         let mut effects = self.fold(changes);
@@ -339,6 +358,9 @@ impl Clipboard {
     pub fn accept(&mut self, entries: Vec<WireEntry>) -> Result<Vec<Effect>> {
         for wire in &entries {
             self.log.validate(wire)?;
+            if let Ok(Event::Copy(copy)) = Event::decode(&wire.payload) {
+                files::validate(&copy.files)?;
+            }
         }
 
         let mut changes = Vec::new();
@@ -400,12 +422,28 @@ impl Clipboard {
         let copy = self.body(id)?;
         let ttl = copy.ttl.map(u64::from).map(Duration::from_secs);
         let secret = copy.secret;
+        let local = self.is_local(id);
         // The new entry is ours, written under this machine's identity, so
-        // what it may claim is what this machine can back up: picking an
-        // entry copied elsewhere must not turn its paths into ours.
-        let selection = self.carried(copy, id);
+        // what it may claim is what this machine can back up: the files of
+        // a copy made elsewhere are ours to name only while we hold their
+        // contents.
+        let held = local || self.ready.contains_key(&id);
+        let files = if held { copy.files.clone() } else { Vec::new() };
+        // Its paths are not carried over even when they are here: a tree
+        // belongs to the entry that named it, and the new entry has none
+        // until its own fetch lands.
+        let selection = if local {
+            copy.selection
+        } else {
+            stripped(copy)
+        };
 
-        self.copy(selection, secret, ttl)
+        let (picked, mut effects) = self.copy(selection, files, secret, ttl)?;
+        if held && !local {
+            effects.push(Effect::Fetch(picked));
+        }
+
+        Ok((picked, effects))
     }
 
     /// Empties the clipboard on every machine.
@@ -526,7 +564,7 @@ impl Clipboard {
                     effects.push(Effect::Forget(entry.id));
                     return;
                 }
-                if let Some(item) = Self::item(entry, &copy) {
+                if let Some(item) = Self::item(entry, copy) {
                     self.items.insert(entry.id, item);
                     Self::store(entry, effects);
                 } else {
@@ -571,6 +609,7 @@ impl Clipboard {
     /// Removes an entry from the history and from the log.
     fn drop_item(&mut self, id: EntryId, effects: &mut Vec<Effect>) {
         self.items.remove(&id);
+        self.ready.remove(&id);
         self.log.remove(id);
         effects.push(Effect::Forget(id));
     }
@@ -588,7 +627,21 @@ impl Clipboard {
                 };
                 self.applied = Some(id);
 
-                vec![Effect::Apply(serves(&self.carried(copy, id)))]
+                // Asked for once, as the entry reaches the clipboard, and
+                // answered by [`Self::materialized`] whenever it lands.
+                // The clipboard is not held up for it: what it holds until
+                // then is the paths as text.
+                let mut effects = Vec::new();
+                if copy.is_files()
+                    && !copy.secret
+                    && !self.is_local(id)
+                    && !self.ready.contains_key(&id)
+                {
+                    effects.push(Effect::Fetch(id));
+                }
+                effects.push(Effect::Apply(serves(&self.carried(copy, id))));
+
+                effects
             }
             None if self.applied.is_some() => {
                 self.applied = None;
@@ -601,7 +654,8 @@ impl Clipboard {
 
     /// Builds the history entry for a copy, or `None` when its lifetime
     /// has already run out and when it carries nothing at all.
-    fn item(entry: &Entry, copy: &Copy) -> Option<Item> {
+    fn item(entry: &Entry, copy: Copy) -> Option<Item> {
+        files::validate(&copy.files).ok()?;
         let expires_at = copy.ttl.map(|ttl| {
             let ttl = Duration::from_secs(u64::from(ttl));
             // Counted from when it was written, but never further out than
@@ -614,16 +668,18 @@ impl Clipboard {
             return None;
         }
 
+        let named = usize::try_from(files::total(&copy.files).ok()?).unwrap_or(usize::MAX);
         let primary = &copy.selection.primary;
 
         Some(Item {
             id: entry.id,
             clock: entry.clock,
             mime: primary.mime.clone(),
-            size: copy.selection.size(),
+            size: copy.selection.size().saturating_add(named),
             secret: copy.secret,
             expires_at,
             preview: preview(&primary.mime, &primary.bytes, copy.secret),
+            files: copy.files.into(),
             hash: hash(&primary.bytes),
         })
     }
@@ -633,17 +689,56 @@ impl Clipboard {
         id.origin == self.log.origin()
     }
 
-    /// The representations of an entry that mean anything on this machine.
-    ///
-    /// A path is only true where the copying happened, so elsewhere what
-    /// is left of an entry that was one is the text of that path, which is
-    /// at least honest.
-    fn carried(&self, copy: Copy, id: EntryId) -> Selection {
-        if self.is_local(id) {
-            return copy.selection;
+    /// Records that an entry's files are on this machine, laid out under
+    /// `tree`, and offers them as files if it is what the clipboard holds.
+    pub fn materialized(&mut self, id: EntryId, tree: PathBuf) -> Vec<Effect> {
+        self.ready.insert(id, tree);
+        // Only the entry on the clipboard has anything new to offer, and
+        // it has to be applied again for the file types to appear.
+        if self.applied == Some(id) {
+            self.applied = None;
         }
 
-        stripped(copy)
+        self.reconcile()
+    }
+
+    /// Where an entry's files are laid out here, if they are.
+    pub fn tree(&self, id: EntryId) -> Option<&Path> {
+        self.ready.get(&id).map(PathBuf::as_path)
+    }
+
+    /// The files an entry names, for the fetch it asked for.
+    pub fn files(&self, id: EntryId) -> Arc<[FileRef]> {
+        self.items
+            .get(&id)
+            .map_or_else(|| Arc::from([]), |item| item.files.clone())
+    }
+
+    /// Every entry the history still holds, and the content those entries
+    /// name: what the spool may keep, and nothing else.
+    pub fn referenced(&self) -> (BTreeSet<EntryId>, BTreeSet<Hash>) {
+        let entries = self.items.keys().copied().collect();
+        let content = self
+            .items
+            .values()
+            .flat_map(|item| item.files.iter().map(|file| file.hash))
+            .collect();
+
+        (entries, content)
+    }
+
+    /// The representations of an entry that mean anything on this machine.
+    ///
+    /// A path is only true where the files are: on the machine that copied
+    /// them, and on any machine that has fetched them since, one that
+    /// picked the entry included. Until then what is left of it is the
+    /// text of those paths, which is at least honest.
+    fn carried(&self, copy: Copy, id: EntryId) -> Selection {
+        match self.ready.get(&id) {
+            Some(tree) => rehomed(&copy, tree),
+            None if self.is_local(id) => copy.selection,
+            None => stripped(copy),
+        }
     }
 
     /// Drops the alternates that do not fit the entry cap, from the back,
@@ -694,6 +789,39 @@ fn stripped(copy: Copy) -> Selection {
         .clone();
 
     Selection::of(Rep::new(mime::PLAIN_TEXT, bytes))
+}
+
+/// The same selection, naming the copies of its files that are on this
+/// machine.
+///
+/// Every representation that names where the files are is rebuilt rather
+/// than carried across, since what it has to say is where they are *here*:
+/// handing a terminal the path the copying machine used would be handing
+/// it a path that does not exist. What the source offered besides is kept.
+/// The preview is not touched, so `yank list` still shows where the entry
+/// came from.
+fn rehomed(copy: &Copy, tree: &Path) -> Selection {
+    let paths: Vec<PathBuf> = copy
+        .files
+        .iter()
+        .map(|file| tree.join(&file.path))
+        .collect();
+
+    let mut selection = Selection::of_files(&paths);
+    selection.alternates.extend(
+        copy.selection
+            .reps()
+            .filter(|rep| !names_a_path(&rep.mime))
+            .cloned(),
+    );
+
+    selection
+}
+
+/// Whether a representation of a selection that names files is one saying
+/// where those files are, and is therefore only true where they sit.
+fn names_a_path(mime: &str) -> bool {
+    mime::is_local(mime) || mime::is_text(mime)
 }
 
 /// What the compositor is handed for a selection: every representation
@@ -768,6 +896,10 @@ mod tests {
         Clipboard::new(log, settings, Pause::default())
     }
 
+    fn no_files() -> Vec<FileRef> {
+        Vec::new()
+    }
+
     fn text(text: &str) -> Selection {
         Selection::of(Rep::new("text/plain", text.as_bytes().to_vec()))
     }
@@ -777,7 +909,10 @@ mod tests {
     }
 
     fn copy(board: &mut Clipboard, contents: &str) -> Vec<Effect> {
-        board.copy(text(contents), false, None).unwrap().1
+        board
+            .copy(text(contents), no_files(), false, None)
+            .unwrap()
+            .1
     }
 
     fn captured(contents: &str, secret: bool) -> Captured {
@@ -860,7 +995,9 @@ mod tests {
     #[test]
     fn what_the_compositor_reports_is_not_put_back() {
         let mut board = clipboard();
-        let effects = board.captured(captured("typed elsewhere", false)).unwrap();
+        let effects = board
+            .captured(captured("typed elsewhere", false), no_files())
+            .unwrap();
 
         // It is already on the clipboard: taking the selection away from
         // the application that owns it would gain nothing.
@@ -907,7 +1044,9 @@ mod tests {
 
         // What a compositor announces after we set the selection, and
         // what a restart finds on the clipboard.
-        let effects = board.captured(captured("hello", false)).unwrap();
+        let effects = board
+            .captured(captured("hello", false), no_files())
+            .unwrap();
         assert!(effects.is_empty());
         assert_eq!(board.history().len(), 1);
     }
@@ -1043,7 +1182,12 @@ mod tests {
     fn a_lifetime_removes_the_entry_and_empties_the_clipboard() {
         let mut board = clipboard();
         board
-            .copy(text("a password"), true, Some(Duration::from_secs(90)))
+            .copy(
+                text("a password"),
+                no_files(),
+                true,
+                Some(Duration::from_secs(90)),
+            )
             .unwrap();
 
         let deadline = board.next_expiry().unwrap();
@@ -1059,7 +1203,12 @@ mod tests {
         let mut board = clipboard();
         copy(&mut board, "something ordinary");
         board
-            .copy(text("a password"), true, Some(Duration::from_secs(90)))
+            .copy(
+                text("a password"),
+                no_files(),
+                true,
+                Some(Duration::from_secs(90)),
+            )
             .unwrap();
 
         let effects = board.expire(board.next_expiry().unwrap());
@@ -1072,8 +1221,13 @@ mod tests {
     #[test]
     fn an_entry_whose_lifetime_ran_out_in_transit_never_lands() {
         let mut peer = clipboard();
-        peer.copy(text("a password"), true, Some(Duration::from_secs(1)))
-            .unwrap();
+        peer.copy(
+            text("a password"),
+            no_files(),
+            true,
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
         let entries = wire(&peer);
 
         let mut board = clipboard();
@@ -1241,7 +1395,9 @@ mod tests {
     #[test]
     fn a_secret_never_goes_to_disk_and_is_never_shown() {
         let mut board = clipboard();
-        board.captured(captured("hunter2", true)).unwrap();
+        board
+            .captured(captured("hunter2", true), no_files())
+            .unwrap();
 
         assert_eq!(previews(&board), vec!["<secret>"]);
         let entries = wire(&board);
@@ -1265,7 +1421,9 @@ mod tests {
             secret_ttl: Duration::from_secs(30),
             ..Settings::default()
         });
-        board.captured(captured("hunter2", true)).unwrap();
+        board
+            .captured(captured("hunter2", true), no_files())
+            .unwrap();
 
         let item = board.selection().unwrap();
         assert!(item.secret);
@@ -1279,7 +1437,7 @@ mod tests {
 
         assert!(
             board
-                .captured(captured("private", false))
+                .captured(captured("private", false), no_files())
                 .unwrap()
                 .is_empty()
         );
@@ -1332,7 +1490,7 @@ mod tests {
             Rep::new("text/plain;charset=utf-8", b"hello".to_vec()),
             Rep::new("text/html", b"<b>hello</b>".to_vec()),
         ]);
-        let effects = board.copy(reps, false, None).unwrap().1;
+        let effects = board.copy(reps, no_files(), false, None).unwrap().1;
 
         let served = served(&effects);
         assert_eq!(served.len(), 2);
@@ -1352,7 +1510,7 @@ mod tests {
             Rep::new("text/plain", b"hello".to_vec()),
             Rep::new("text/html", b"<b>hello</b>".to_vec()),
         ]);
-        board.copy(reps, false, None).unwrap();
+        board.copy(reps, no_files(), false, None).unwrap();
         let first = board.selection().unwrap().id;
         copy(&mut board, "something else");
 
@@ -1373,7 +1531,7 @@ mod tests {
                 b"cut\nfile:///home/x/y.iso".to_vec(),
             ),
         ]);
-        let effects = peer.copy(reps, false, None).unwrap().1;
+        let effects = peer.copy(reps, no_files(), false, None).unwrap().1;
         assert_eq!(served(&effects)[0].0, vec!["text/uri-list".to_owned()]);
 
         let mut board = clipboard();
@@ -1392,7 +1550,7 @@ mod tests {
     fn picking_a_file_copied_elsewhere_does_not_make_it_a_file_here() {
         let mut peer = clipboard();
         let reps = Selection::of(Rep::new("text/uri-list", b"file:///home/x/y.iso".to_vec()));
-        peer.copy(reps, false, None).unwrap();
+        peer.copy(reps, no_files(), false, None).unwrap();
 
         let mut board = clipboard();
         board.accept(wire(&peer)).unwrap();
@@ -1417,12 +1575,170 @@ mod tests {
             ),
             Rep::new("text/uri-list", b"file:///home/x/y.iso".to_vec()),
         ]);
-        peer.copy(reps, false, None).unwrap();
+        peer.copy(reps, no_files(), false, None).unwrap();
 
         let mut board = clipboard();
         let effects = board.accept(wire(&peer)).unwrap();
 
         assert_eq!(served(&effects)[0].1, "file:///home/x/y.iso");
+    }
+
+    fn one_file() -> Vec<FileRef> {
+        vec![FileRef {
+            path: "y.iso".to_owned(),
+            size: 4,
+            hash: Hash::of(b"iso!"),
+        }]
+    }
+
+    fn file_copy(board: &mut Clipboard) -> Vec<Effect> {
+        let selection = Selection::of_files(&[PathBuf::from("/home/x/y.iso")]);
+
+        board.copy(selection, one_file(), false, None).unwrap().1
+    }
+
+    /// A file entry reaching the clipboard is asked for, once, and holds
+    /// the paths as text until it arrives: the clipboard is never held up
+    /// for a transfer.
+    #[test]
+    fn a_file_entry_asks_for_its_contents_and_waits_as_text() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        let effects = board.accept(wire(&peer)).unwrap();
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Fetch(_)))
+                .count(),
+            1,
+        );
+        let served = served(&effects);
+        assert_eq!(served.len(), 1, "no file type is offered yet");
+        assert!(served[0].0.contains(&"text/plain".to_owned()));
+    }
+
+    /// And once they land it is a file again, pointing at the copies that
+    /// are here rather than at a path on the machine that copied it.
+    #[test]
+    fn the_files_landing_makes_it_a_file_reference_again() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let id = board.selection().unwrap().id;
+        let effects = board.materialized(id, PathBuf::from("/spool/trees/abc"));
+
+        let served = served(&effects);
+        let types: Vec<&str> = served.iter().map(|(mimes, _)| mimes[0].as_str()).collect();
+        assert_eq!(
+            types,
+            vec![mime::PLAIN_TEXT, mime::URI_LIST, mime::GNOME_COPIED_FILES],
+        );
+        assert_eq!(
+            served[0].1, "/spool/trees/abc/y.iso\n",
+            "the text is a path this machine has, not the one it was copied from",
+        );
+        assert_eq!(served[1].1, "file:///spool/trees/abc/y.iso\r\n");
+        assert_eq!(
+            served[2].1, "copy\nfile:///spool/trees/abc/y.iso",
+            "a cut pasted here would move the only copy of the content",
+        );
+    }
+
+    /// And a picked one is a file again under the tree it earned, not
+    /// under the one it was picked from: the entry is written here, so
+    /// nothing else would ever rehome it.
+    #[test]
+    fn a_picked_file_entry_is_a_file_again_once_its_own_tree_lands() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let id = board.selection().unwrap().id;
+        board.materialized(id, PathBuf::from("/spool/trees/first"));
+
+        let (picked, _) = board.pick(id).unwrap();
+        let effects = board.materialized(picked, PathBuf::from("/spool/trees/second"));
+
+        let served = served(&effects);
+        let types: Vec<&str> = served.iter().map(|(mimes, _)| mimes[0].as_str()).collect();
+        assert_eq!(
+            types,
+            vec![mime::PLAIN_TEXT, mime::URI_LIST, mime::GNOME_COPIED_FILES],
+        );
+        assert_eq!(served[1].1, "file:///spool/trees/second/y.iso\r\n");
+    }
+
+    /// Picking a file entry copied elsewhere writes it under this
+    /// machine's identity, so it has to earn a tree of its own: the one it
+    /// was pointing at belongs to the entry it came from, and goes when
+    /// that entry does.
+    #[test]
+    fn picking_a_file_entry_asks_for_a_tree_of_its_own() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let id = board.selection().unwrap().id;
+        board.materialized(id, PathBuf::from("/spool/trees/first"));
+
+        let (picked, effects) = board.pick(id).unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Fetch(asked) if *asked == picked)),
+        );
+        assert_eq!(board.files(picked).len(), 1, "it still names the content");
+
+        let served = served(&effects);
+        assert_eq!(served.len(), 1, "and offers no file until its tree exists");
+        assert!(served[0].0.contains(&"text/plain".to_owned()));
+    }
+
+    /// And picking one whose files never arrived names no file at all: an
+    /// entry written here must not claim content this machine cannot
+    /// serve.
+    #[test]
+    fn picking_a_file_entry_that_never_arrived_carries_no_manifest() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let id = board.selection().unwrap().id;
+
+        let (picked, effects) = board.pick(id).unwrap();
+        assert!(board.files(picked).is_empty());
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Fetch(_))),
+        );
+    }
+
+    /// The spool may keep what the history still names, and nothing else.
+    #[test]
+    fn what_the_history_drops_the_spool_stops_keeping() {
+        let mut peer = clipboard();
+        file_copy(&mut peer);
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let id = board.selection().unwrap().id;
+
+        let (entries, content) = board.referenced();
+        assert!(entries.contains(&id));
+        assert!(content.contains(&one_file()[0].hash));
+
+        board.forget(id).unwrap();
+        let (entries, content) = board.referenced();
+        assert!(entries.is_empty() && content.is_empty());
     }
 
     /// A selection whose alternates do not fit is still worth sharing.
@@ -1435,13 +1751,16 @@ mod tests {
             ..Settings::default()
         });
         board
-            .captured(Captured {
-                selection: selection(vec![
-                    Rep::new("text/plain", b"hello".to_vec()),
-                    Rep::new("text/html", vec![b'x'; 32]),
-                ]),
-                secret: false,
-            })
+            .captured(
+                Captured {
+                    selection: selection(vec![
+                        Rep::new("text/plain", b"hello".to_vec()),
+                        Rep::new("text/html", vec![b'x'; 32]),
+                    ]),
+                    secret: false,
+                },
+                no_files(),
+            )
             .unwrap();
 
         let item = board.selection().unwrap();
@@ -1460,6 +1779,7 @@ mod tests {
             board
                 .copy(
                     Selection::of(Rep::new("text/plain", vec![b'x'; 9])),
+                    no_files(),
                     false,
                     None
                 )
@@ -1467,7 +1787,7 @@ mod tests {
         );
         assert!(
             board
-                .captured(captured("much too long", false))
+                .captured(captured("much too long", false), no_files())
                 .unwrap()
                 .is_empty(),
         );
