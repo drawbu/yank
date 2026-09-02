@@ -52,6 +52,7 @@ pub struct Cli {
 enum Command {
     Copy(clip::CopyArgs),
     Paste(clip::PasteArgs),
+    Get(clip::GetArgs),
     #[command(visible_alias = "history")]
     List(clip::ListArgs),
     Pick(clip::PickArgs),
@@ -82,6 +83,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Copy(args) => clip::copy(args, &dirs),
         Command::Paste(args) => clip::paste(&args, &dirs),
+        Command::Get(args) => clip::get(&args, &dirs),
         Command::List(args) => clip::list(&args, &dirs),
         Command::Pick(args) => clip::pick(args, &dirs),
         Command::Rm(args) => clip::rm(args, &dirs),

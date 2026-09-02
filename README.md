@@ -9,6 +9,7 @@ history.
 - Clipboard is share *almost* instantly.
 - Support pausing/resuming gracefully.
 - Catches up when a machine is off, asleep or offline, and it comes back.
+- Support copying files
 - Support for sharing secret with a lifetime (like copying from a password manager).
 
 ```console
@@ -98,7 +99,9 @@ Here are some useful commands. See `yank help`.
 
 ```sh
 $ echo hi | yank copy       # copy from a pipe, like wl-copy
+$ yank copy -f ./photos     # copy files, contents and all
 $ yank paste                # print the clipboard, for pipes
+$ yank get abc123-4         # write an entry's files here
 $ yank list                 # the shared history, newest first
 $ yank pick abc123-4        # put one of those back on the clipboard
 $ yank rm abc123-4          # remove one entry from every machine
@@ -116,9 +119,8 @@ Connections are mutually authenticated with a per-machine Ed25519 key and
 end-to-end encrypted.
 See [iroh's Security & Privacy](https://docs.iroh.computer/concepts/security-privacy).
 
-The history is stored in `~/.local/state/yank`, in plain text, as clipboard
-managers generally do. Though, entries marked secret are saved in memory and
-wiped when dropped.
+Non-secret history and copied files are stored in `~/.local/state/yank` in
+plain.
 
 ## Acknowledgements
 

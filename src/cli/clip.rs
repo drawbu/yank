@@ -1,18 +1,22 @@
 //! The clipboard commands: copying, pasting, and the shared history.
 
 use std::{
+    fs,
     io::{IsTerminal as _, Read as _, Write as _},
+    path::PathBuf,
     time::Duration,
 };
 
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
 use super::ui;
 use crate::{
     clip::mime::PLAIN_TEXT,
     config::Dirs,
-    daemon::control::{CLIENT_TIMEOUT, HistoryEntry, Request, Response, request},
+    daemon::control::{
+        CLIENT_TIMEOUT, COPY_FILES_TIMEOUT, FILES_TIMEOUT, HistoryEntry, Request, Response, request,
+    },
 };
 
 /// Copy something to every machine
@@ -43,6 +47,36 @@ pub struct CopyArgs {
     /// Type to copy it as
     #[arg(long, value_name = "MIME", default_value = PLAIN_TEXT)]
     mime: String,
+
+    /// File or folder to copy, contents and all; repeatable
+    ///
+    /// The other machines get the file itself, not the path, and pasting
+    /// it there writes it wherever it is pasted.
+    ///
+    /// Not for a secret: sharing a file writes it to disk on every machine
+    /// that holds the entry, which is the one thing `--secret` promises
+    /// never happens.
+    #[arg(
+        long = "file",
+        short = 'f',
+        value_name = "PATH",
+        conflicts_with_all = ["mime", "secret"],
+    )]
+    files: Vec<PathBuf>,
+}
+
+/// Write the files of an entry here
+///
+/// The daemon fetches them from whoever has them, which takes as long as
+/// the files are large.
+#[derive(Debug, Args)]
+pub struct GetArgs {
+    /// Entry to write, from `yank list`; the current one by default
+    entry: Option<String>,
+
+    /// Where to write them
+    #[arg(long, short = 'C', value_name = "DIR", default_value = ".")]
+    to: PathBuf,
 }
 
 /// Print what is on the clipboard
@@ -95,6 +129,10 @@ pub struct ClearArgs {
 }
 
 pub fn copy(args: CopyArgs, dirs: &Dirs) -> Result<()> {
+    if !args.files.is_empty() {
+        return copy_files(&args, dirs);
+    }
+
     let bytes = if args.text.is_empty() {
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
@@ -121,6 +159,93 @@ pub fn copy(args: CopyArgs, dirs: &Dirs) -> Result<()> {
         }
         other => unexpected(&other),
     }
+}
+
+/// Shares files themselves rather than the text of their paths.
+fn copy_files(args: &CopyArgs, dirs: &Dirs) -> Result<()> {
+    if !args.text.is_empty() {
+        bail!("copy either text or files, not both");
+    }
+
+    let paths = args
+        .files
+        .iter()
+        .map(|path| {
+            // The other machines are told where this came from as well as
+            // what it is, and a relative path means nothing there.
+            let path = path.canonicalize()?;
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect::<std::io::Result<Vec<String>>>()?;
+
+    let response = request(
+        dirs,
+        &Request::CopyFiles {
+            paths,
+            ttl_secs: args.ttl.map(|ttl| ttl.as_secs()),
+        },
+        // Spooling is a copy of every file, and the daemon answers once it
+        // is done: an entry never names content it cannot serve.
+        COPY_FILES_TIMEOUT,
+    )?;
+
+    match response {
+        Response::Wrote { label } => {
+            anstream::println!("{}", ui::good(format_args!("Copied as {label}")));
+            Ok(())
+        }
+        other => unexpected(&other),
+    }
+}
+
+/// Writes an entry's files here.
+///
+/// The daemon answers once they are laid out on this machine, so what
+/// takes time is the transfer itself.
+pub fn get(args: &GetArgs, dirs: &Dirs) -> Result<()> {
+    let response = request(
+        dirs,
+        &Request::Files {
+            entry: args.entry.clone(),
+        },
+        FILES_TIMEOUT,
+    )?;
+    let Response::Files { label, tree, files } = response else {
+        return unexpected(&response);
+    };
+    let Some(tree) = tree else {
+        bail!("the files of {label} have not arrived; the daemon is still trying");
+    };
+    let tree = PathBuf::from(tree);
+
+    // Checked before anything is written, so a collision halfway through
+    // does not leave half an entry behind.
+    for file in &files {
+        let to = args.to.join(&file.path);
+        ensure!(!to.exists(), "{} is already there", to.display());
+    }
+    for file in &files {
+        let (from, to) = (tree.join(&file.path), args.to.join(&file.path));
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Sharing the blocks with the spool where the filesystem can, the
+        // way spooling them did: getting a four gigabyte image out costs a
+        // directory entry rather than four gigabytes.
+        reflink_copy::reflink_or_copy(&from, &to)
+            .wrap_err_with(|| format!("cannot write {}", to.display()))?;
+    }
+
+    anstream::println!(
+        "{}",
+        ui::good(format_args!(
+            "Wrote {} file(s) from {label} to {}",
+            files.len(),
+            args.to.display(),
+        )),
+    );
+
+    Ok(())
 }
 
 pub fn paste(args: &PasteArgs, dirs: &Dirs) -> Result<()> {
@@ -251,6 +376,17 @@ pub fn clear(args: &ClearArgs, dirs: &Dirs) -> Result<()> {
 fn preview(entry: &HistoryEntry) -> String {
     let preview = if entry.secret {
         ui::warn(&entry.preview).to_string()
+    } else if entry.files > 0 {
+        format!(
+            "{} {}",
+            entry.preview,
+            ui::dim(format_args!(
+                "({} file{}, {})",
+                entry.files,
+                if entry.files == 1 { "" } else { "s" },
+                bytesize::ByteSize::b(entry.size as u64),
+            )),
+        )
     } else {
         entry.preview.clone()
     };
