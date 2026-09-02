@@ -8,20 +8,24 @@
 //!                        ┌───────────────────────── daemon ──┐
 //!   CLI ── unix socket ──┤ control ─┐                        │
 //!                        │          ├─► clipboard ◄─► topics │
-//!   compositor ──────────┤ backend ─┘        │           │   │
-//!                        │                   ▼           ▼   │
-//!   peers ── QUIC ───────┤ peer tasks ◄──── hub      mesh    │
+//!   compositor ──────────┤ backend ─┘    │   │          │    │
+//!                        │               │   ▼          ▼    │
+//!   peers ── QUIC ───────┤ peer tasks ◄──┼─ hub       mesh   │
+//!                        │               ▼                   │
+//!                        │             files ─► the spool    │
 //!                        └───────────────────────────────────┘
 //! ```
 //!
 //! Subsystems talk through the types they share, never directly: the
 //! the `hub` carries what the clipboard has to say to peers, `topics` is
-//! how a peer's entries find their way back to a feature, and `store`
-//! owns the mesh state everything else reads.
+//! how a peer's entries find their way back to a feature, `store` owns
+//! the mesh state everything else reads, and `files` is where everything
+//! slow about a copied file happens, off the clipboard's path.
 
 mod backoff;
 pub mod clip;
 pub mod control;
+pub mod files;
 mod hub;
 mod pairing;
 mod peers;
@@ -110,8 +114,20 @@ impl Daemon {
         info!("daemon started as {}", key.endpoint_id());
 
         let hub = Arc::new(Hub::new());
+        let store = Arc::new(crate::files::Store::open(&dirs.files_dir())?);
+        let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
+        let spool = files::Spool {
+            store: store.clone(),
+            jobs: jobs_tx,
+        };
         let topics = Arc::new(Topics {
-            clipboard: ClipService::open(dirs, key.endpoint_id(), settings, hub.clone())?,
+            clipboard: ClipService::open(
+                dirs,
+                key.endpoint_id(),
+                settings.clone(),
+                hub.clone(),
+                spool.clone(),
+            )?,
         });
         // Announced before anything can connect, so the hub has something
         // to replay to the first peer that does. Without it a machine that
@@ -125,9 +141,10 @@ impl Daemon {
             key.endpoint_id(),
             hub.clone(),
             topics.clone(),
+            store.clone(),
             gossip_tx,
         ));
-        let store = Arc::new(MeshStore::new(
+        let mesh = Arc::new(MeshStore::new(
             dirs.clone(),
             state,
             peers.clone(),
@@ -136,7 +153,7 @@ impl Daemon {
         let pairing = Arc::new(Pairing::new(
             endpoint.clone(),
             options.uses_relays(),
-            store.clone(),
+            mesh.clone(),
         ));
 
         let ctx = Arc::new(Context {
@@ -144,15 +161,22 @@ impl Daemon {
             started: SystemTime::now(),
             peers: peers.clone(),
             topics: topics.clone(),
-            store: store.clone(),
+            store: mesh.clone(),
             pairing: pairing.clone(),
         });
 
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { server.serve(ctx).await });
+        tasks.spawn(files::run(
+            topics.clipboard.clone(),
+            peers.clone(),
+            settings,
+            spool,
+            jobs_rx,
+        ));
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
-        tasks.spawn(merge_loop(gossip_rx, key.endpoint_id(), store.clone()));
-        tasks.spawn(anti_entropy_loop(store, topics.clone(), hub));
+        tasks.spawn(merge_loop(gossip_rx, key.endpoint_id(), mesh.clone()));
+        tasks.spawn(anti_entropy_loop(mesh, topics.clone(), hub));
         tasks.spawn(clip::run(topics.clipboard.clone()));
 
         Ok(Daemon { tasks, endpoint })

@@ -14,8 +14,9 @@
 //! ```text
 //!   incoming uni  ─► membership  ─► the mesh state
 //!                 └─ summary     ─► the fetcher below
-//!   incoming bi   ─► fetch request ─► entries streamed back
-//!   fetcher       ─► fetch request ─► entries handed to the topic
+//!   incoming bi   ─► entries ask ─► entries streamed back
+//!                 └─ content ask ─► a file streamed out of the spool
+//!   fetcher       ─► entries ask ─► entries handed to the topic
 //! ```
 //!
 //! The fetcher is a task of its own so that pulling from a peer never
@@ -39,9 +40,12 @@ use tracing::{debug, info};
 use super::{backoff::Backoff, control, hub::Hub, topics::Topics};
 use crate::{
     config::{Membership, MeshState},
+    files::Store,
     log::WireEntry,
     net::{
-        proto::{self, FetchFrame, FetchRequest, Summary, UniMessage},
+        proto::{
+            self, Ask, ContentReply, ContentRequest, FetchFrame, FetchRequest, Summary, UniMessage,
+        },
         wire::{read_message, write_message},
     },
 };
@@ -49,8 +53,8 @@ use crate::{
 /// Incoming one-shot streams handled at once per connection.
 const MAX_UNI_STREAMS: usize = 16;
 
-/// Incoming fetch requests served at once per connection.
-const MAX_FETCH_STREAMS: usize = 4;
+/// Incoming bidirectional streams served at once per connection.
+const MAX_ASK_STREAMS: usize = 4;
 
 /// Budget for reading one message, so a stalled stream does not hold its
 /// slot forever.
@@ -80,6 +84,8 @@ pub struct PeerSet {
     local_id: EndpointId,
     hub: Arc<Hub>,
     topics: Arc<Topics>,
+    /// The spool, to serve a peer the content an entry named.
+    store: Arc<Store>,
     /// Memberships received from peers, drained by the daemon.
     gossip: mpsc::Sender<(EndpointId, Membership)>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
@@ -108,6 +114,7 @@ impl PeerSet {
         local_id: EndpointId,
         hub: Arc<Hub>,
         topics: Arc<Topics>,
+        store: Arc<Store>,
         gossip: mpsc::Sender<(EndpointId, Membership)>,
     ) -> Self {
         PeerSet {
@@ -115,6 +122,7 @@ impl PeerSet {
             local_id,
             hub,
             topics,
+            store,
             gossip,
             peers: Mutex::new(BTreeMap::new()),
         }
@@ -186,6 +194,27 @@ impl PeerSet {
         }
     }
 
+    /// Every machine reachable right now, closest to `first` in the list.
+    ///
+    /// Content is asked for outside the replication loop, from whoever
+    /// happens to be up: the machine that copied a file is the one most
+    /// likely to still have it, and is also the one most likely to be
+    /// asleep.
+    pub fn connected(&self, first: EndpointId) -> Vec<(EndpointId, Connection)> {
+        let peers = self.peers.lock().unwrap();
+
+        let mut connected: Vec<(EndpointId, Connection)> = peers
+            .iter()
+            .filter_map(|(id, handle)| match &*handle.state.lock().unwrap() {
+                PeerState::Connected { conn, .. } => Some((*id, conn.clone())),
+                _ => None,
+            })
+            .collect();
+        connected.sort_by_key(|(id, _)| *id != first);
+
+        connected
+    }
+
     /// A snapshot of every machine, for `yank status`.
     pub fn statuses(&self) -> Vec<control::PeerStatus> {
         let peers = self.peers.lock().unwrap();
@@ -225,6 +254,7 @@ impl PeerSet {
             state: state.clone(),
             hub: self.hub.clone(),
             topics: self.topics.clone(),
+            store: self.store.clone(),
             gossip: self.gossip.clone(),
             inbound: rx,
         }));
@@ -278,6 +308,7 @@ struct PeerTask {
     state: Arc<Mutex<PeerState>>,
     hub: Arc<Hub>,
     topics: Arc<Topics>,
+    store: Arc<Store>,
     gossip: mpsc::Sender<(EndpointId, Membership)>,
     inbound: mpsc::Receiver<Connection>,
 }
@@ -354,7 +385,7 @@ impl PeerTask {
         // The peer is authenticated, which is not a licence to make us
         // spawn as much work as it likes.
         let uni_permits = Arc::new(Semaphore::new(MAX_UNI_STREAMS));
-        let fetch_permits = Arc::new(Semaphore::new(MAX_FETCH_STREAMS));
+        let ask_permits = Arc::new(Semaphore::new(MAX_ASK_STREAMS));
 
         let (mut summaries, inbox) = mpsc::channel(SUMMARY_QUEUE);
         let mut fetcher = tokio::spawn(run_fetcher(
@@ -414,7 +445,7 @@ impl PeerTask {
                         debug!(peer = %self.name, "connection lost");
                         break;
                     };
-                    self.serve_fetch(send, recv, &fetch_permits);
+                    self.serve_ask(send, recv, &ask_permits);
                 }
             }
         }
@@ -471,29 +502,34 @@ impl PeerTask {
         });
     }
 
-    /// Answers a peer's pull with the entries it lacks.
-    fn serve_fetch(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
+    /// Answers whatever a peer opened a stream to ask for.
+    fn serve_ask(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping a fetch: too many open streams");
+            debug!(peer = %self.name, "dropping a request: too many open streams");
             return;
         };
 
         let topics = self.topics.clone();
+        let store = self.store.clone();
         let name = self.name.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let read = tokio::time::timeout(
                 STREAM_READ_TIMEOUT,
-                read_message::<FetchRequest>(&mut recv, proto::MAX_REQUEST_SIZE),
+                read_message::<Ask>(&mut recv, proto::MAX_REQUEST_SIZE),
             );
-            let request = match read.await {
-                Ok(Ok(request)) => request,
-                Ok(Err(err)) => return debug!(peer = %name, "bad fetch request: {err:#}"),
-                Err(_) => return debug!(peer = %name, "fetch request timed out"),
+            let ask = match read.await {
+                Ok(Ok(ask)) => ask,
+                Ok(Err(err)) => return debug!(peer = %name, "bad request: {err:#}"),
+                Err(_) => return debug!(peer = %name, "request timed out"),
             };
 
-            if let Err(err) = send_entries(send, &topics, &request).await {
-                debug!(peer = %name, "cannot serve a fetch: {err:#}");
+            let served = match ask {
+                Ask::Entries(request) => send_entries(send, &topics, &request).await,
+                Ask::Content(request) => send_content(send, &store, &request).await,
+            };
+            if let Err(err) = served {
+                debug!(peer = %name, "cannot serve a request: {err:#}");
             }
         });
     }
@@ -501,6 +537,46 @@ impl PeerTask {
     fn set_state(&self, state: PeerState) {
         *self.state.lock().unwrap() = state;
     }
+}
+
+/// Streams a file out of the spool, or says it is not here.
+///
+/// Sent raw after the header rather than framed: a file does not fit in a
+/// frame, and the receiver knows what it asked for, so it knows when it
+/// has it all. What it may not know is whether the bytes are the ones it
+/// asked for, which is why they are named by their hash.
+async fn send_content(mut send: SendStream, store: &Store, request: &ContentRequest) -> Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    let blob = store.blob(request.hash);
+    let Ok(mut file) = tokio::fs::File::open(&blob).await else {
+        write_message(&mut send, &ContentReply::Missing, proto::MAX_REQUEST_SIZE).await?;
+        send.finish()?;
+
+        return Ok(());
+    };
+
+    let size = file.metadata().await?.len();
+    let at = request.at.min(size);
+    file.seek(std::io::SeekFrom::Start(at)).await?;
+    write_message(
+        &mut send,
+        &ContentReply::Sending { size: size - at },
+        proto::MAX_REQUEST_SIZE,
+    )
+    .await?;
+
+    let mut chunk = vec![0u8; proto::CONTENT_CHUNK];
+    loop {
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        send.write_all(&chunk[..read]).await?;
+    }
+    send.finish()?;
+
+    Ok(())
 }
 
 /// Streams the entries a peer asked for, then says so.
@@ -573,7 +649,7 @@ async fn fetch(
     since: crate::log::Watermark,
 ) -> Result<Vec<WireEntry>> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let request = FetchRequest { topic, since };
+    let request = Ask::Entries(FetchRequest { topic, since });
     write_message(&mut send, &request, proto::MAX_REQUEST_SIZE).await?;
     send.finish()?;
 

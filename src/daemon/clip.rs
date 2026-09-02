@@ -16,23 +16,30 @@
 //! after the session goes away and comes back.
 
 use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{Result, WrapErr as _, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, info, warn};
 
-use super::{backoff::Backoff, hub::Hub};
+use super::{
+    backoff::Backoff,
+    files::{Job, Spool},
+    hub::Hub,
+};
 use crate::{
     clip::{
         Backend as _, Captured, Clipboard, Effect, Item, Pause, Policy, Rep, Selection, Switch,
         backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, write_private},
+    files::{FileRef, Hash},
     log::{self, Checkpoint, EntryId, Log, Watermark, WireEntry},
     net::proto::Topic,
 };
@@ -78,9 +85,25 @@ pub struct ClipService {
     backend: Mutex<Option<Platform>>,
     down: Mutex<Option<String>>,
     hub: Arc<Hub>,
+    /// Where a copied file's contents go, and where the ones an entry
+    /// names are asked for.
+    spool: Spool,
     /// Woken when the state changed in a way the service loop cares about:
     /// a new lifetime to wait for, or a pause that was lifted.
     wake: Notify,
+    /// Woken when an entry's files have been laid out here, for whoever is
+    /// waiting on one.
+    arrived: Notify,
+}
+
+/// Where an entry's files are.
+#[derive(Debug)]
+pub struct Located {
+    pub id: EntryId,
+    pub files: Arc<[FileRef]>,
+    /// The tree they are laid out in, `None` while they are still on their
+    /// way.
+    pub tree: Option<PathBuf>,
 }
 
 impl ClipService {
@@ -91,6 +114,7 @@ impl ClipService {
         identity: EndpointId,
         settings: Arc<Settings>,
         hub: Arc<Hub>,
+        spool: Spool,
     ) -> Result<Arc<Self>> {
         let persisted = load_persisted(dirs)?;
         let history = dirs.history_dir();
@@ -110,7 +134,9 @@ impl ClipService {
             backend: Mutex::new(None),
             down: Mutex::new(Some("starting".to_owned())),
             hub,
+            spool,
             wake: Notify::new(),
+            arrived: Notify::new(),
         });
         // Files the caps or a replayed removal dropped as the history was
         // read back. They hold clipboard contents in plain text, so they
@@ -140,23 +166,129 @@ impl ClipService {
 
     /// Copies something from this machine.
     pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> Result<EntryId> {
-        let (id, effects) = self
-            .board
-            .lock()
-            .unwrap()
-            .copy(Selection::of(rep), secret, ttl)?;
+        let (id, effects) =
+            self.board
+                .lock()
+                .unwrap()
+                .copy(Selection::of(rep), Vec::new(), secret, ttl)?;
         self.perform(effects);
 
         Ok(id)
     }
 
-    /// Records a selection the compositor reported.
-    pub fn record(&self, captured: Captured) {
-        let recorded = self.board.lock().unwrap().captured(captured);
+    /// Copies files from this machine: their contents are spooled first,
+    /// so the entry never names what this machine cannot serve.
+    ///
+    /// What goes on the clipboard is the paths, the way a file manager
+    /// offers them. Pasting it here is pasting the originals; pasting it
+    /// on another machine is pasting the copies that land there.
+    pub async fn copy_files(
+        self: &Arc<Self>,
+        paths: Vec<PathBuf>,
+        ttl: Option<Duration>,
+    ) -> Result<EntryId> {
+        ensure!(
+            self.settings.files,
+            "sharing files is turned off in config.toml",
+        );
+
+        let service = self.clone();
+        let spooled = paths.clone();
+        let files = tokio::task::spawn_blocking(move || {
+            super::files::take_all(&service.spool.store, &spooled, &service.settings)
+        })
+        .await
+        .wrap_err("the spool task failed")??;
+
+        let reserved = files.clone();
+        let copied =
+            self.board
+                .lock()
+                .unwrap()
+                .copy(Selection::of_files(&paths), files, false, ttl);
+        self.spool.store.release(&reserved);
+        let (id, effects) = copied?;
+        self.perform(effects);
+
+        Ok(id)
+    }
+
+    /// Where an entry's files are, asking for them when they are not here
+    /// and waiting up to `within` for them to arrive.
+    ///
+    /// The wait is the point: a transfer takes as long as the files are
+    /// large, and a caller polling for the answer would ask hundreds of
+    /// times to be told the same thing. Past the deadline the answer says
+    /// they are not here; the fetch carries on regardless.
+    pub async fn located(&self, needle: Option<&str>, within: Duration) -> Result<Located> {
+        let (id, files) = {
+            let board = self.board.lock().unwrap();
+            let id = board.named(needle)?.id;
+            let files = board.files(id);
+            ensure!(!files.is_empty(), "entry {id} names no file");
+            ensure!(
+                !board.is_local(id),
+                "entry {id} was copied here; its files are where they always were",
+            );
+
+            (id, files)
+        };
+
+        let deadline = Instant::now() + within;
+        loop {
+            // Registered before the tree is looked for, or files landing
+            // between the two would be a wake-up nobody was waiting for.
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+
+            let tree = self.board.lock().unwrap().tree(id).map(Path::to_path_buf);
+            if tree.is_some() {
+                return Ok(Located { id, files, tree });
+            }
+            // Fetching happens when an entry reaches the clipboard, so an
+            // older one has to be asked for; never once its files are
+            // here, since a fetch lays the tree out again and rebuilding
+            // one somebody is reading is how a paste finds half of it.
+            self.spool.send(Job::Fetch(id));
+
+            let left = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(left, arrived).await.is_err() {
+                return Ok(Located {
+                    id,
+                    files,
+                    tree: None,
+                });
+            }
+        }
+    }
+
+    /// Records a selection the compositor reported, with the files it
+    /// named once they are spooled.
+    pub fn record(&self, captured: Captured, files: Vec<FileRef>) {
+        let recorded = self.board.lock().unwrap().captured(captured, files);
         match recorded {
             Ok(effects) => self.perform(effects),
             Err(err) => warn!("cannot record the selection: {err:#}"),
         }
+    }
+
+    /// Records that an entry's files are on this machine now.
+    pub fn materialized(&self, id: EntryId, tree: PathBuf) {
+        let effects = self.board.lock().unwrap().materialized(id, tree);
+        self.perform(effects);
+        self.arrived.notify_waiters();
+    }
+
+    /// The files an entry names.
+    pub fn files(&self, id: EntryId) -> Arc<[FileRef]> {
+        self.board.lock().unwrap().files(id)
+    }
+
+    /// What the spool may keep: the entries the history still holds, and
+    /// the content they name.
+    pub fn referenced(&self) -> (BTreeSet<EntryId>, BTreeSet<Hash>) {
+        self.board.lock().unwrap().referenced()
     }
 
     /// Makes an entry already in the history the selection again.
@@ -280,13 +412,24 @@ impl ClipService {
             return;
         }
 
+        let mut forgot = false;
         for effect in effects {
             match effect {
                 Effect::Store(entry) => self.writer.store(&entry),
-                Effect::Forget(id) => self.writer.forget(id),
+                Effect::Forget(id) => {
+                    self.writer.forget(id);
+                    forgot = true;
+                }
                 Effect::Apply(serves) => self.to_backend(Command::Offer(serves)),
                 Effect::ClearSelection => self.to_backend(Command::Clear),
+                Effect::Fetch(id) => self.spool.send(Job::Fetch(id)),
             }
+        }
+        // An entry that went takes its files with it. Swept rather than
+        // deleted one by one: the same content may be named by another
+        // entry, and only the whole history knows.
+        if forgot {
+            self.spool.send(Job::Sweep);
         }
 
         if let Err(err) = self.persist() {
@@ -405,7 +548,24 @@ impl ClipService {
     fn on_backend_event(&self, event: backend::Event) -> bool {
         match event {
             backend::Event::Copied(captured) => {
-                self.record(captured);
+                // A selection that names files is recorded by the file
+                // service instead, once their contents are spooled: an
+                // entry must never name content this machine cannot serve.
+                // A secret is the exception, since spooling is a write to
+                // disk and a secret never touches one.
+                let paths = if self.settings.files && !captured.secret {
+                    captured.selection.file_paths()
+                } else {
+                    Vec::new()
+                };
+                if paths.is_empty() {
+                    self.spool.send(Job::Record(captured));
+                } else {
+                    self.spool.send(Job::Snapshot {
+                        captured: Box::new(captured),
+                        paths,
+                    });
+                }
                 false
             }
             backend::Event::Lost(reason) => {

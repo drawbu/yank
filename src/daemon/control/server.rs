@@ -16,7 +16,10 @@ use iroh::Endpoint;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, warn};
 
-use super::protocol::{ClipboardStatus, HistoryEntry, MAX_MESSAGE_SIZE, Request, Response, Status};
+use super::protocol::{
+    ClipboardStatus, FILES_WAIT, FileInfo, HistoryEntry, MAX_MESSAGE_SIZE, Request, Response,
+    Status,
+};
 use crate::{
     clip::{Item, Rep},
     config::{Dirs, sanitize_bounded},
@@ -191,6 +194,30 @@ async fn answer(ctx: &Context, request: Request) -> Result<Response> {
 
             Ok(Response::Wrote { label: id.label() })
         }
+        Request::CopyFiles { paths, ttl_secs } => {
+            let paths = paths.into_iter().map(std::path::PathBuf::from).collect();
+            let id = clip
+                .copy_files(paths, ttl_secs.map(Duration::from_secs))
+                .await?;
+
+            Ok(Response::Wrote { label: id.label() })
+        }
+        Request::Files { entry } => {
+            let located = clip.located(entry.as_deref(), FILES_WAIT).await?;
+
+            Ok(Response::Files {
+                label: located.id.label(),
+                tree: located.tree.map(|tree| tree.to_string_lossy().into_owned()),
+                files: located
+                    .files
+                    .iter()
+                    .map(|file| FileInfo {
+                        path: file.path.clone(),
+                        size: file.size,
+                    })
+                    .collect(),
+            })
+        }
         Request::Paste { entry, mime } => {
             let (mime, alternates, bytes) = clip.paste(entry.as_deref(), mime.as_deref())?;
 
@@ -293,6 +320,7 @@ fn entry(
         mime: item.mime.clone(),
         size: item.size,
         secret: item.secret,
+        files: item.files.len(),
         origin,
         age_secs: now
             .duration_since(item.clock.as_system_time())

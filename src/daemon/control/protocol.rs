@@ -20,6 +20,18 @@ pub const MAX_MESSAGE_SIZE: u32 = crate::log::MAX_ENTRY_BYTES + 64 * 1024;
 /// Budget for a request the daemon answers without touching the network.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Budget for a copy of files, which the daemon answers once every one of
+/// them is spooled: an entry never names content this machine cannot
+/// serve, and a folder takes as long as it takes.
+pub const COPY_FILES_TIMEOUT: Duration = Duration::from_mins(10);
+
+/// How long the daemon waits for an entry's files to arrive from a peer
+/// before answering that they have not. The fetch carries on either way.
+pub const FILES_WAIT: Duration = Duration::from_mins(5);
+
+/// Budget for that request, with room for the answer to come back.
+pub const FILES_TIMEOUT: Duration = FILES_WAIT.saturating_add(CLIENT_TIMEOUT);
+
 /// Budget for issuing a pairing ticket, which may first wait for a relay.
 pub const TICKET_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -56,6 +68,14 @@ pub enum Request {
         entry: Option<String>,
         mime: Option<String>,
     },
+    /// Put files on the clipboard of every machine, contents and all.
+    CopyFiles {
+        paths: Vec<String>,
+        ttl_secs: Option<u64>,
+    },
+    /// Where an entry's files are on this machine, asking for them if they
+    /// are not here yet and waiting for them to arrive.
+    Files { entry: Option<String> },
     /// List the history, newest first.
     History { limit: Option<usize> },
     /// Make an entry the selection again.
@@ -100,6 +120,14 @@ pub enum Response {
         bytes: Vec<u8>,
     },
     History(Vec<HistoryEntry>),
+    /// The files an entry names, and where they are.
+    Files {
+        label: String,
+        /// Where they are laid out, once they are all here. `None` means
+        /// they are still on their way.
+        tree: Option<String>,
+        files: Vec<FileInfo>,
+    },
     Cleared,
     Paused(Pause),
     /// The request failed. The message is already safe to print.
@@ -140,6 +168,8 @@ pub struct HistoryEntry {
     pub mime: String,
     pub size: usize,
     pub secret: bool,
+    /// How many files it names, zero when it names none.
+    pub files: usize,
     /// The machine that copied it, by its paired name when we know it.
     pub origin: String,
     /// How long ago it was copied.
@@ -148,6 +178,14 @@ pub struct HistoryEntry {
     pub expires_in_secs: Option<u64>,
     /// Whether this is what the clipboard holds.
     pub selected: bool,
+}
+
+/// One file an entry names.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileInfo {
+    /// Where the file sits under the entry's root.
+    pub path: String,
+    pub size: u64,
 }
 
 /// One paired machine.

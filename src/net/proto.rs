@@ -8,9 +8,16 @@
 //! ```text
 //! ── uni: membership ──►  who is in the mesh
 //! ── uni: summary ─────►  what I hold, per topic
-//! ◄─ bi:  fetch ────────  what you hold that I lack
+//! ◄─ bi:  entries ──────  what you hold that I lack
 //! ── bi:  entry, …, end ►
+//! ◄─ bi:  content ──────  the bytes named by this hash
+//! ── bi:  sending, … ───►
 //! ```
+//!
+//! Entries are bounded and replicated to everyone; content is neither. It
+//! is named by hash in an entry, asked for only by a machine that wants
+//! it, and streamed raw after a header rather than framed, because a file
+//! does not fit in a frame.
 //!
 //! Messages are tagged with the [`Topic`] they belong to, which is the
 //! seam a second feature would come in through: the connection, the
@@ -23,20 +30,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{MAX_MESH_PEERS, Membership},
+    files::Hash,
     log::{MAX_ENTRY_BYTES, Watermark, WireEntry},
 };
 
 /// ALPN of the replication protocol. Bumped whenever the wire format
 /// changes, so mismatched daemons refuse each other instead of
 /// misreading each other.
-pub const ALPN: &[u8] = b"yank/sync/1";
+pub const ALPN: &[u8] = b"yank/sync/2";
 
 /// Cap on a unidirectional message. Sized for the largest legitimate one,
 /// a membership listing a full mesh, with room to spare.
 pub const MAX_UNI_SIZE: u32 = 64 * 1024;
 
-/// Cap on a fetch request.
+/// Cap on what opens a bidirectional stream.
 pub const MAX_REQUEST_SIZE: u32 = 16 * 1024;
+
+/// How much of a content transfer is read at a time.
+pub const CONTENT_CHUNK: usize = 256 * 1024;
 
 /// Cap on one frame of a fetch response: an entry at the protocol ceiling
 /// plus its envelope.
@@ -85,11 +96,44 @@ pub struct Summary {
     pub have: Watermark,
 }
 
+/// What opens a bidirectional stream.
+///
+/// Same rule as [`Topic`] about variant positions.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Ask {
+    /// Send me the entries of a topic I lack.
+    Entries(FetchRequest),
+    /// Send me the bytes named by a hash.
+    Content(ContentRequest),
+}
+
 /// Opens a pull: "send me everything past this".
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchRequest {
     pub topic: Topic,
     pub since: Watermark,
+}
+
+/// Asks for content named by an entry, and says how much of it is already
+/// here: a transfer that died halfway resumes rather than starting over.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContentRequest {
+    pub hash: Hash,
+    pub at: u64,
+}
+
+/// What comes back before the bytes of a content transfer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ContentReply {
+    /// This many bytes follow, being what is left after the offset asked
+    /// for. The receiver knows what the whole should weigh, and what it
+    /// should hash to, from the entry that named it.
+    Sending { size: u64 },
+    /// Not on this machine. Another peer may have it, and the machine that
+    /// copied it may not be up.
+    Missing,
 }
 
 /// One frame of a fetch response.
