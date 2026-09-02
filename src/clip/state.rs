@@ -30,9 +30,9 @@ use color_eyre::eyre::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::{
+    backend::Captured,
     event::{Copy, Event},
     mime,
-    wayland::Captured,
 };
 use crate::{
     config::Settings,

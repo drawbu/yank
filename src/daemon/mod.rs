@@ -8,7 +8,7 @@
 //!                        ┌───────────────────────── daemon ──┐
 //!   CLI ── unix socket ──┤ control ─┐                        │
 //!                        │          ├─► clipboard ◄─► topics │
-//!   compositor ──────────┤ wayland ─┘        │           │   │
+//!   compositor ──────────┤ backend ─┘        │           │   │
 //!                        │                   ▼           ▼   │
 //!   peers ── QUIC ───────┤ peer tasks ◄──── hub      mesh    │
 //!                        └───────────────────────────────────┘

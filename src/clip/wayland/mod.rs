@@ -41,44 +41,16 @@ use wayland_client::{
 };
 
 use self::protocol::{Device, DeviceEvent, Manager, Offer, Source, SourceEvent};
-use super::mime;
+use super::{
+    backend::{self, Captured, Command, Event},
+    mime,
+};
 use crate::log::Payload;
 
-/// What the daemon asks the backend to do.
+/// The Wayland clipboard, as the daemon holds it. Dropping it stops the
+/// thread.
 #[derive(Debug)]
-pub enum Command {
-    /// Take the selection and serve `bytes` for every type in `mimes`.
-    Offer { mimes: Vec<String>, bytes: Payload },
-    /// Empty the selection.
-    Clear,
-}
-
-/// What the backend tells the daemon.
-#[derive(Debug)]
-pub enum Event {
-    /// Something was copied by an application other than us.
-    Copied(Captured),
-    /// The selection was emptied by somebody else.
-    Emptied,
-    /// The backend is gone: the compositor exited, or withdrew the
-    /// protocol. The daemon reconnects.
-    Lost(String),
-}
-
-/// A selection read off the local clipboard.
-#[derive(Debug)]
-pub struct Captured {
-    /// The type the bytes are in.
-    pub mime: String,
-    pub bytes: Vec<u8>,
-    /// Whether the source flagged this as a password (see
-    /// [`mime::SECRET_HINT`]).
-    pub secret: bool,
-}
-
-/// A running backend. Dropping it stops the thread.
-#[derive(Debug)]
-pub struct Backend {
+pub struct Wayland {
     commands: Option<mpsc::Sender<Command>>,
     /// Writing to this wakes the poll in the backend thread; without it a
     /// command would sit in the channel until Wayland happened to say
@@ -87,11 +59,11 @@ pub struct Backend {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-impl Backend {
+impl Wayland {
     /// Connects to the compositor and starts serving. `max_bytes` caps
     /// what a single capture may read, so an application offering a
     /// gigabyte cannot be used to exhaust our memory.
-    pub fn spawn(events: &tokio_mpsc::UnboundedSender<Event>, max_bytes: usize) -> Result<Self> {
+    pub fn connect(events: &tokio_mpsc::UnboundedSender<Event>, max_bytes: usize) -> Result<Self> {
         let (wake_rx, wake) = rustix::pipe::pipe().wrap_err("cannot create the wake pipe")?;
         let (commands, queue) = mpsc::channel();
         let (ready, started) = mpsc::channel();
@@ -115,7 +87,7 @@ impl Backend {
             .wrap_err("cannot start the Wayland thread")?;
 
         match started.recv() {
-            Ok(Ok(())) => Ok(Backend {
+            Ok(Ok(())) => Ok(Wayland {
                 commands: Some(commands),
                 wake,
                 thread: Some(thread),
@@ -124,9 +96,11 @@ impl Backend {
             Err(_) => Err(eyre!("the Wayland thread stopped before it started")),
         }
     }
+}
 
+impl backend::Backend for Wayland {
     /// Queues a command, waking the backend thread to run it.
-    pub fn send(&self, command: Command) {
+    fn send(&self, command: Command) {
         let Some(commands) = &self.commands else {
             return;
         };
@@ -139,7 +113,7 @@ impl Backend {
     }
 }
 
-impl Drop for Backend {
+impl Drop for Wayland {
     fn drop(&mut self) {
         // Closing the queue is what ends the loop; the wake makes the
         // thread notice now rather than at the next Wayland event.

@@ -27,10 +27,15 @@ tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-th
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1.9"
+
+# The Wayland backend, and nothing else, needs these. Kept apart so a
+# build for another platform fails on the backend it is missing rather
+# than on a Wayland binding it could never have used.
+[target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-zeroize = "1.9"
 
 [features]
 # Hermetic endpoints and helpers used by the integration tests.

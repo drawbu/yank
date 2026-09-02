@@ -29,8 +29,8 @@ use tracing::{debug, info, warn};
 use super::{backoff::Backoff, hub::Hub};
 use crate::{
     clip::{
-        Clipboard, Effect, Item, Pause, Switch,
-        wayland::{self, Backend},
+        Backend as _, Clipboard, Effect, Item, Pause, Switch,
+        backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, write_private},
     log::{self, Checkpoint, EntryId, Log, Watermark, WireEntry},
@@ -75,7 +75,7 @@ pub struct ClipService {
     settings: Arc<Settings>,
     board: Mutex<Clipboard>,
     writer: log::Writer,
-    backend: Mutex<Option<Backend>>,
+    backend: Mutex<Option<Platform>>,
     down: Mutex<Option<String>>,
     hub: Arc<Hub>,
     /// Woken when the state changed in a way the service loop cares about:
@@ -254,9 +254,9 @@ impl ClipService {
                 Effect::Store(entry) => self.writer.store(&entry),
                 Effect::Forget(id) => self.writer.forget(id),
                 Effect::Apply { mimes, bytes } => {
-                    self.to_backend(wayland::Command::Offer { mimes, bytes });
+                    self.to_backend(Command::Offer { mimes, bytes });
                 }
-                Effect::ClearSelection => self.to_backend(wayland::Command::Clear),
+                Effect::ClearSelection => self.to_backend(Command::Clear),
             }
         }
 
@@ -268,7 +268,7 @@ impl ClipService {
     }
 
     /// Hands a command to the compositor, if there is one.
-    fn to_backend(&self, command: wayland::Command) {
+    fn to_backend(&self, command: Command) {
         if let Some(backend) = &*self.backend.lock().unwrap() {
             backend.send(command);
         } else {
@@ -353,10 +353,10 @@ impl ClipService {
     /// Connecting means a round trip to the compositor, which is a
     /// blocking call on a process that may be busy or wedged, so it does
     /// not run on the async runtime.
-    async fn connect_backend(&self, events: &mpsc::UnboundedSender<wayland::Event>) -> Result<()> {
+    async fn connect_backend(&self, events: &mpsc::UnboundedSender<backend::Event>) -> Result<()> {
         let events = events.clone();
         let max_bytes = self.settings.max_entry_bytes();
-        let backend = tokio::task::spawn_blocking(move || Backend::spawn(&events, max_bytes))
+        let backend = tokio::task::spawn_blocking(move || backend::connect(&events, max_bytes))
             .await
             .wrap_err("the clipboard connection task failed")?
             .wrap_err("cannot read the clipboard")?;
@@ -374,9 +374,9 @@ impl ClipService {
 
     /// Handles one event from the compositor. Returns whether the backend
     /// has to be reconnected.
-    fn on_backend_event(&self, event: wayland::Event) -> bool {
+    fn on_backend_event(&self, event: backend::Event) -> bool {
         match event {
-            wayland::Event::Copied(captured) => {
+            backend::Event::Copied(captured) => {
                 // Bound before performing: `perform` takes the same lock,
                 // and a guard in a `match` scrutinee would still be held
                 // while its arms run.
@@ -393,7 +393,7 @@ impl ClipService {
                 self.perform(effects);
                 false
             }
-            wayland::Event::Emptied => {
+            backend::Event::Emptied => {
                 // Somebody emptied the clipboard here. It is not shared:
                 // applications empty it when they exit, and wiping every
                 // machine for that would be worse than doing nothing.
@@ -405,7 +405,7 @@ impl ClipService {
                 self.perform(effects);
                 false
             }
-            wayland::Event::Lost(reason) => {
+            backend::Event::Lost(reason) => {
                 warn!("clipboard disconnected: {reason}");
                 // Taken out of the lock before it is dropped: dropping a
                 // backend waits for its thread.
