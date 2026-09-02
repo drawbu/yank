@@ -324,7 +324,12 @@ async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> Result<()> {
     // It is pastable on the other machine, which is the point of sharing
     // it, and nowhere in its history directory, which is the point of
     // marking it.
-    let Response::Contents { bytes, .. } = second.ask(&Request::Paste { entry: None }).await?
+    let Response::Contents { bytes, .. } = second
+        .ask(&Request::Paste {
+            entry: None,
+            mime: None,
+        })
+        .await?
     else {
         bail!("expected the contents");
     };

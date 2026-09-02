@@ -6,18 +6,21 @@
 //!
 //! ```text
 //!   state ──► Command ──►  backend  ──► Event ──► state
-//!             Offer                    Copied(Captured)
+//!             Offer(Serve)             Copied(Captured)
 //!             Clear                    Emptied
 //!                                      Lost
 //! ```
 //!
-//! Two properties are what make a platform implementable, and both are
-//! properties yank needs rather than Wayland accidents:
+//! Three properties are what make a platform implementable, and every one
+//! of them is a property yank needs rather than a Wayland accident:
 //!
 //! - **Mime is the vocabulary.** A platform that names its own types
 //!   differently, macOS and its uniform type identifiers for instance,
 //!   translates at its own edge. Two machines naming the same bytes
 //!   differently would each have to understand both, forever.
+//! - **A selection is several representations at once** ([`Serve`],
+//!   [`Captured`]), because which one gets pasted is the pasting
+//!   application's choice, not ours.
 //! - **Serving is lazy.** A backend is asked for bytes when somebody
 //!   pastes, which is what `wl_data_source` does with a file descriptor
 //!   and what `NSPasteboardItemDataProvider` does with a callback.
@@ -29,13 +32,14 @@
 use color_eyre::eyre::Result;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::event::Selection;
 use crate::log::Payload;
 
 /// What the daemon asks a backend to do.
 #[derive(Debug)]
 pub enum Command {
-    /// Take the selection and serve `bytes` for every type in `mimes`.
-    Offer { mimes: Vec<String>, bytes: Payload },
+    /// Take the selection and serve these representations of it.
+    Offer(Vec<Serve>),
     /// Empty the selection.
     Clear,
 }
@@ -55,12 +59,27 @@ pub enum Event {
 /// A selection read off the local clipboard.
 #[derive(Debug)]
 pub struct Captured {
-    /// The type the bytes are in.
-    pub mime: String,
-    pub bytes: Vec<u8>,
+    pub selection: Selection,
     /// Whether the source flagged this as a password (see
     /// [`mime::SECRET_HINT`](super::mime::SECRET_HINT)).
     pub secret: bool,
+}
+
+/// One representation of a selection to hand a pasting application: the
+/// bytes, and every type they are announced under.
+#[derive(Clone, Debug)]
+pub struct Serve {
+    pub mimes: Vec<String>,
+    pub bytes: Payload,
+}
+
+/// What a backend is allowed to capture.
+#[derive(Clone, Debug)]
+pub struct Policy {
+    /// Cap on one selection, every representation of it together.
+    pub max_bytes: usize,
+    /// Types never read (`ignore-mime` in config.toml).
+    pub ignore: Vec<String>,
 }
 
 /// A running backend. Dropping it stops it.
@@ -91,19 +110,16 @@ impl Backend for Platform {
 
 /// Connects to whatever holds the clipboard on this platform.
 ///
-/// `max_bytes` caps what a single capture may read, so an application
-/// offering a gigabyte cannot be used to exhaust our memory.
-///
 /// Failing here is ordinary: a machine with no graphical session has no
 /// clipboard to hold, and the daemon keeps replicating without one.
-pub fn connect(events: &UnboundedSender<Event>, max_bytes: usize) -> Result<Platform> {
+pub fn connect(events: &UnboundedSender<Event>, policy: Policy) -> Result<Platform> {
     #[cfg(target_os = "linux")]
     {
-        Platform::connect(events, max_bytes)
+        Platform::connect(events, policy)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (events, max_bytes);
+        let _ = (events, policy);
         color_eyre::eyre::bail!("yank has no clipboard backend for this platform yet")
     }
 }

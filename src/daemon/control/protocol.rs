@@ -50,8 +50,12 @@ pub enum Request {
         secret: bool,
         ttl_secs: Option<u64>,
     },
-    /// Read an entry, the current selection when none is named.
-    Paste { entry: Option<String> },
+    /// Read an entry, the current selection when none is named, in one of
+    /// the types it carries, the best one when none is named either.
+    Paste {
+        entry: Option<String>,
+        mime: Option<String>,
+    },
     /// List the history, newest first.
     History { limit: Option<usize> },
     /// Make an entry the selection again.
@@ -87,9 +91,12 @@ pub enum Response {
     Wrote {
         label: String,
     },
-    /// The contents of an entry.
+    /// The contents of an entry, in one of the types it carries.
     Contents {
+        /// The type `bytes` is in.
         mime: String,
+        /// The other types the entry carries.
+        alternates: Vec<String>,
         bytes: Vec<u8>,
     },
     History(Vec<HistoryEntry>),

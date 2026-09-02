@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 use super::{backoff::Backoff, hub::Hub};
 use crate::{
     clip::{
-        Backend as _, Clipboard, Effect, Item, Pause, Switch,
+        Backend as _, Captured, Clipboard, Effect, Item, Pause, Policy, Rep, Selection, Switch,
         backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, write_private},
@@ -139,17 +139,30 @@ impl ClipService {
     }
 
     /// Copies something from this machine.
-    pub fn copy(
-        &self,
-        mime: String,
-        bytes: Vec<u8>,
-        secret: bool,
-        ttl: Option<Duration>,
-    ) -> Result<EntryId> {
-        let (id, effects) = self.board.lock().unwrap().copy(mime, bytes, secret, ttl)?;
+    pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> Result<EntryId> {
+        let (id, effects) = self
+            .board
+            .lock()
+            .unwrap()
+            .copy(Selection::of(rep), secret, ttl)?;
         self.perform(effects);
 
         Ok(id)
+    }
+
+    /// Records a selection the compositor reported.
+    pub fn record(&self, captured: Captured) {
+        let recorded = self.board.lock().unwrap().captured(captured);
+        match recorded {
+            Ok(effects) => self.perform(effects),
+            Err(err) => warn!("cannot record the selection: {err:#}"),
+        }
+
+        // Whatever the compositor holds is now accounted for, so an entry
+        // the mesh chose while we were down can be applied without
+        // overwriting a newer local one.
+        let effects = self.board.lock().unwrap().settle();
+        self.perform(effects);
     }
 
     /// Makes an entry already in the history the selection again.
@@ -163,21 +176,45 @@ impl ClipService {
         Ok(picked)
     }
 
-    /// The bytes of an entry: the selection when none is named.
-    pub fn paste(&self, needle: Option<&str>) -> Result<(String, Vec<u8>)> {
+    /// One representation of an entry: the selection when none is named,
+    /// and its best type when none is asked for.
+    ///
+    /// Returns the type of the bytes, and the other types the entry
+    /// carries.
+    pub fn paste(
+        &self,
+        needle: Option<&str>,
+        mime: Option<&str>,
+    ) -> Result<(String, Vec<String>, Vec<u8>)> {
         let board = self.board.lock().unwrap();
-        let id = match needle {
-            Some(needle) => board.resolve(needle)?.id,
-            None => {
-                board
-                    .selection()
-                    .ok_or_else(|| color_eyre::eyre::eyre!("the clipboard is empty"))?
-                    .id
-            }
-        };
+        let id = board.named(needle)?.id;
         let copy = board.body(id)?;
 
-        Ok((copy.mime, copy.bytes))
+        let rep = match mime {
+            Some(mime) => copy.selection.rep(mime).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "entry {id} has no {} in it; it has {}",
+                    crate::config::sanitize(mime),
+                    copy.selection
+                        .reps()
+                        .map(|rep| rep.mime.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            })?,
+            None => &copy.selection.primary,
+        };
+        // Compared by where they sit rather than by name: the type asked
+        // for is matched case-insensitively, so `--type TEXT/HTML` would
+        // otherwise list `text/html` as an alternative to itself.
+        let alternates = copy
+            .selection
+            .reps()
+            .filter(|other| !std::ptr::eq(*other, rep))
+            .map(|other| other.mime.clone())
+            .collect();
+
+        Ok((rep.mime.clone(), alternates, rep.bytes.clone()))
     }
 
     /// Drops one entry from every machine.
@@ -253,9 +290,7 @@ impl ClipService {
             match effect {
                 Effect::Store(entry) => self.writer.store(&entry),
                 Effect::Forget(id) => self.writer.forget(id),
-                Effect::Apply { mimes, bytes } => {
-                    self.to_backend(Command::Offer { mimes, bytes });
-                }
+                Effect::Apply(serves) => self.to_backend(Command::Offer(serves)),
                 Effect::ClearSelection => self.to_backend(Command::Clear),
             }
         }
@@ -355,8 +390,11 @@ impl ClipService {
     /// not run on the async runtime.
     async fn connect_backend(&self, events: &mpsc::UnboundedSender<backend::Event>) -> Result<()> {
         let events = events.clone();
-        let max_bytes = self.settings.max_entry_bytes();
-        let backend = tokio::task::spawn_blocking(move || backend::connect(&events, max_bytes))
+        let policy = Policy {
+            max_bytes: self.settings.max_entry_bytes(),
+            ignore: self.settings.ignore_mime.clone(),
+        };
+        let backend = tokio::task::spawn_blocking(move || backend::connect(&events, policy))
             .await
             .wrap_err("the clipboard connection task failed")?
             .wrap_err("cannot read the clipboard")?;
@@ -377,20 +415,7 @@ impl ClipService {
     fn on_backend_event(&self, event: backend::Event) -> bool {
         match event {
             backend::Event::Copied(captured) => {
-                // Bound before performing: `perform` takes the same lock,
-                // and a guard in a `match` scrutinee would still be held
-                // while its arms run.
-                let recorded = self.board.lock().unwrap().captured(captured);
-                match recorded {
-                    Ok(effects) => self.perform(effects),
-                    Err(err) => warn!("cannot record the selection: {err:#}"),
-                }
-
-                // Whatever the compositor holds is now accounted for, so
-                // an entry the mesh chose while we were down can be
-                // applied without overwriting a newer local one.
-                let effects = self.board.lock().unwrap().settle();
-                self.perform(effects);
+                self.record(captured);
                 false
             }
             backend::Event::Emptied => {

@@ -10,12 +10,10 @@ use color_eyre::eyre::{Result, bail};
 
 use super::ui;
 use crate::{
+    clip::mime::PLAIN_TEXT,
     config::Dirs,
     daemon::control::{CLIENT_TIMEOUT, HistoryEntry, Request, Response, request},
 };
-
-/// The type given to text copied from the command line.
-const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
 /// Copy something to every machine
 ///
@@ -43,7 +41,7 @@ pub struct CopyArgs {
     secret: bool,
 
     /// Type to copy it as
-    #[arg(long, value_name = "MIME", default_value = TEXT_MIME)]
+    #[arg(long, value_name = "MIME", default_value = PLAIN_TEXT)]
     mime: String,
 }
 
@@ -53,9 +51,13 @@ pub struct PasteArgs {
     /// Entry to print, from `yank list`; the current one by default
     entry: Option<String>,
 
-    /// Print the type instead of the contents
+    /// Print the types the entry carries instead of the contents
     #[arg(long)]
     mime: bool,
+
+    /// Type to print it in, when the entry carries several
+    #[arg(long = "type", value_name = "MIME")]
+    mime_type: Option<String>,
 }
 
 /// List the shared history, newest first
@@ -126,14 +128,21 @@ pub fn paste(args: &PasteArgs, dirs: &Dirs) -> Result<()> {
         dirs,
         &Request::Paste {
             entry: args.entry.clone(),
+            mime: args.mime_type.clone(),
         },
         CLIENT_TIMEOUT,
     )?;
 
     match response {
-        Response::Contents { mime, bytes } => {
+        Response::Contents {
+            mime,
+            alternates,
+            bytes,
+        } => {
             if args.mime {
-                anstream::println!("{mime}");
+                for mime in std::iter::once(mime).chain(alternates) {
+                    anstream::println!("{mime}");
+                }
                 return Ok(());
             }
 

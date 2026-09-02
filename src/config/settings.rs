@@ -38,7 +38,9 @@ const TEMPLATE: &str = r#"# yank configuration
 # is on the clipboard right now.
 #history-limit = 100
 
-# Largest single entry that gets shared. Anything above is ignored, and
+# Largest single entry that gets shared, every type it is carried in
+# together. The types that do not fit are dropped, best kept first, and a
+# selection whose first type is over on its own is not shared at all.
 # 4 MiB is as high as this goes: it is what one entry may weigh on the
 # wire.
 #max-entry-size = "1 MiB"
@@ -74,8 +76,15 @@ pub struct Settings {
     /// Lifetime given to a secret entry when the caller asks for none.
     #[serde(deserialize_with = "duration")]
     pub secret_ttl: Duration,
-    /// Mime types never captured, on top of [`Self::is_ignored_mime`]'s
-    /// built-in refusals.
+    /// Mime types never captured, on top of what
+    /// [`crate::clip::mime`] refuses on its own. A selection whose best
+    /// type is one of these is dropped whole, and the backend reads none
+    /// of it (see [`crate::clip::Policy`]).
+    ///
+    /// The password-manager hint is how KeePassXC, 1Password and others
+    /// ask clipboard managers to leave an entry alone; yank honors it by
+    /// marking the entry secret rather than by dropping it (see
+    /// [`crate::clip`]), so it is not listed here.
     pub ignore_mime: Vec<String>,
 }
 
@@ -145,16 +154,6 @@ impl Settings {
         usize::try_from(self.max_entry_size.as_u64())
             .unwrap_or(usize::MAX)
             .min(crate::log::MAX_ENTRY_BYTES as usize)
-    }
-
-    /// Whether a mime type must never be captured.
-    ///
-    /// The password-manager hint is how KeePassXC, 1Password and others
-    /// ask clipboard managers to leave an entry alone; yank honors it by
-    /// marking the entry secret rather than by dropping it (see
-    /// [`crate::clip`]), so it is not listed here.
-    pub fn is_ignored_mime(&self, mime: &str) -> bool {
-        self.ignore_mime.iter().any(|ignored| ignored == mime)
     }
 }
 

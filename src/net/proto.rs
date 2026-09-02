@@ -29,7 +29,7 @@ use crate::{
 /// ALPN of the replication protocol. Bumped whenever the wire format
 /// changes, so mismatched daemons refuse each other instead of
 /// misreading each other.
-pub const ALPN: &[u8] = b"yank/sync/0";
+pub const ALPN: &[u8] = b"yank/sync/1";
 
 /// Cap on a unidirectional message. Sized for the largest legitimate one,
 /// a membership listing a full mesh, with room to spare.

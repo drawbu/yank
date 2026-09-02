@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use super::protocol::{ClipboardStatus, HistoryEntry, MAX_MESSAGE_SIZE, Request, Response, Status};
 use crate::{
-    clip::Item,
+    clip::{Item, Rep},
     config::{Dirs, sanitize_bounded},
     daemon::{
         backoff::Backoff, clip::BackendState, pairing::Pairing, peers::PeerSet, store::MeshStore,
@@ -187,14 +187,18 @@ async fn answer(ctx: &Context, request: Request) -> Result<Response> {
             ttl_secs,
         } => {
             let ttl = ttl_secs.map(Duration::from_secs);
-            let id = clip.copy(mime, bytes, secret, ttl)?;
+            let id = clip.copy(Rep::new(mime, bytes), secret, ttl)?;
 
             Ok(Response::Wrote { label: id.label() })
         }
-        Request::Paste { entry } => {
-            let (mime, bytes) = clip.paste(entry.as_deref())?;
+        Request::Paste { entry, mime } => {
+            let (mime, alternates, bytes) = clip.paste(entry.as_deref(), mime.as_deref())?;
 
-            Ok(Response::Contents { mime, bytes })
+            Ok(Response::Contents {
+                mime,
+                alternates,
+                bytes,
+            })
         }
         Request::History { limit } => {
             let entries = history(ctx, limit);

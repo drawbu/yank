@@ -24,14 +24,15 @@ pub(crate) mod protocol;
 
 use std::{
     collections::HashMap,
-    io::{Read as _, Write as _},
+    io::Write as _,
     os::fd::{AsFd as _, OwnedFd},
     sync::mpsc,
     thread,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, eyre};
-use rustix::event::{PollFd, PollFlags, poll};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, warn};
 use wayland_client::{
@@ -42,10 +43,21 @@ use wayland_client::{
 
 use self::protocol::{Device, DeviceEvent, Manager, Offer, Source, SourceEvent};
 use super::{
-    backend::{self, Captured, Command, Event},
+    backend::{self, Captured, Command, Event, Policy, Serve},
+    event::{Rep, Selection},
     mime,
 };
-use crate::log::Payload;
+
+/// How much of one transfer is read at a time.
+const CHUNK: usize = 64 * 1024;
+
+/// How long one selection has to arrive, every type of it together.
+///
+/// An application is free to advertise a type it then never writes to,
+/// and some do. Without a deadline that pipe never reaches an end, the
+/// reading thread waits on it for good, and the whole selection is lost
+/// with it rather than the one type.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Wayland clipboard, as the daemon holds it. Dropping it stops the
 /// thread.
@@ -60,10 +72,10 @@ pub struct Wayland {
 }
 
 impl Wayland {
-    /// Connects to the compositor and starts serving. `max_bytes` caps
-    /// what a single capture may read, so an application offering a
-    /// gigabyte cannot be used to exhaust our memory.
-    pub fn connect(events: &tokio_mpsc::UnboundedSender<Event>, max_bytes: usize) -> Result<Self> {
+    /// Connects to the compositor and starts serving. [`Policy`] caps what
+    /// a single capture may read, so an application offering a gigabyte
+    /// cannot be used to exhaust our memory.
+    pub fn connect(events: &tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> Result<Self> {
         let (wake_rx, wake) = rustix::pipe::pipe().wrap_err("cannot create the wake pipe")?;
         let (commands, queue) = mpsc::channel();
         let (ready, started) = mpsc::channel();
@@ -71,7 +83,7 @@ impl Wayland {
         let events = events.clone();
         let thread = thread::Builder::new()
             .name("yank-wayland".to_owned())
-            .spawn(move || match Session::connect(events.clone(), max_bytes) {
+            .spawn(move || match Session::connect(events.clone(), policy) {
                 Ok(mut session) => {
                     let _ = ready.send(Ok(()));
                     let reason = match session.run(&wake_rx, &queue) {
@@ -145,7 +157,7 @@ struct State {
     /// The selection we own, if any.
     held: Option<Held>,
     events: tokio_mpsc::UnboundedSender<Event>,
-    max_bytes: usize,
+    policy: Policy,
     /// Cleared when the compositor withdraws the device, which ends the
     /// loop.
     alive: bool,
@@ -157,14 +169,15 @@ struct State {
 /// A selection the handler decided to read.
 struct PendingRead {
     offer: Offer,
-    mime: String,
+    /// The types to read it in, best first.
+    mimes: Vec<String>,
     secret: bool,
 }
 
 /// The selection this daemon owns.
 struct Held {
     source: Source,
-    bytes: Payload,
+    serves: Vec<Serve>,
 }
 
 protocol::impl_manager_dispatch!(State);
@@ -187,7 +200,7 @@ impl wayland_client::Dispatch<WlRegistry, GlobalListContents> for State {
 impl Session {
     /// Connects, binds the globals and picks up the selection already on
     /// the clipboard.
-    fn connect(events: tokio_mpsc::UnboundedSender<Event>, max_bytes: usize) -> Result<Self> {
+    fn connect(events: tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> Result<Self> {
         let connection = Connection::connect_to_env()
             .wrap_err("cannot connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
         let (globals, queue) = registry_queue_init::<State>(&connection)
@@ -220,7 +233,7 @@ impl Session {
                 current: None,
                 held: None,
                 events,
-                max_bytes,
+                policy,
                 alive: true,
                 pending_read: None,
             },
@@ -286,8 +299,8 @@ impl Session {
     fn run_commands(&mut self, commands: &mpsc::Receiver<Command>) -> Result<(), ()> {
         loop {
             match commands.try_recv() {
-                Ok(Command::Offer { mimes, bytes }) => {
-                    self.state.offer(&self.queue.handle(), &mimes, bytes);
+                Ok(Command::Offer(serves)) => {
+                    self.state.offer(&self.queue.handle(), serves);
                 }
                 Ok(Command::Clear) => self.state.clear(),
                 Err(mpsc::TryRecvError::Empty) => return Ok(()),
@@ -296,9 +309,9 @@ impl Session {
         }
     }
 
-    /// Issues the read a selection event asked for.
+    /// Issues the reads a selection event asked for, one pipe per type.
     ///
-    /// The request has to be flushed before the reading thread sees
+    /// The requests have to be flushed before the reading thread sees
     /// anything, and the handler that decided to read cannot flush: the
     /// queue is dispatching into the very state it holds.
     fn start_pending_read(&mut self) {
@@ -306,32 +319,34 @@ impl Session {
             return;
         };
 
-        let (read, write) = match rustix::pipe::pipe() {
-            Ok(pipe) => pipe,
-            Err(err) => return warn!("cannot create a clipboard pipe: {err}"),
-        };
-        pending.offer.receive(pending.mime.clone(), write.as_fd());
-        // The compositor hands the write end to the source application;
-        // our copy has to go, or the read never reaches an end.
-        drop(write);
+        let mut pipes = Vec::with_capacity(pending.mimes.len());
+        for mime in pending.mimes {
+            let (read, write) = match rustix::pipe::pipe() {
+                Ok(pipe) => pipe,
+                Err(err) => return warn!("cannot create a clipboard pipe: {err}"),
+            };
+            pending.offer.receive(mime.clone(), write.as_fd());
+            // The compositor hands the write end to the source
+            // application; our copy has to go, or the read never reaches
+            // an end.
+            drop(write);
+            pipes.push((mime, read));
+        }
         if let Err(err) = self.connection.flush() {
             return warn!("cannot ask for the clipboard contents: {err}");
         }
 
         let events = self.state.events.clone();
-        let max_bytes = self.state.max_bytes;
+        let max_bytes = self.state.policy.max_bytes;
         let spawned = thread::Builder::new()
             .name("yank-clipboard-read".to_owned())
-            .spawn(move || match read_all(read, max_bytes) {
-                Ok(bytes) if bytes.is_empty() => {}
-                Ok(bytes) => {
+            .spawn(move || {
+                if let Some(selection) = Selection::new(read_selection(pipes, max_bytes)) {
                     let _ = events.send(Event::Copied(Captured {
-                        mime: pending.mime,
-                        bytes,
+                        selection,
                         secret: pending.secret,
                     }));
                 }
-                Err(err) => debug!("cannot read the clipboard: {err:#}"),
             });
         if let Err(err) = spawned {
             warn!("cannot read the clipboard: {err}");
@@ -358,14 +373,15 @@ impl State {
                     return;
                 }
                 let secret = mimes.iter().any(|mime| mime == mime::SECRET_HINT);
-                let Some(mime) = mime::choose(&mimes) else {
+                let wanted = mime::select(&mimes, &self.policy.ignore);
+                if wanted.is_empty() {
                     debug!("ignoring a selection with no usable type: {mimes:?}");
                     return;
-                };
+                }
 
                 self.pending_read = Some(PendingRead {
                     offer,
-                    mime: mime.to_owned(),
+                    mimes: wanted.into_iter().map(str::to_owned).collect(),
                     secret,
                 });
             }
@@ -393,7 +409,21 @@ impl State {
 
         match event {
             SourceEvent::Send { mime, fd } => {
-                let bytes = held.bytes.clone();
+                // A type we never announced cannot be asked for, so the
+                // fallback is only ever a compositor being loose about
+                // what it forwards.
+                let bytes = held
+                    .serves
+                    .iter()
+                    .find(|serve| {
+                        serve
+                            .mimes
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&mime))
+                    })
+                    .unwrap_or(&held.serves[0])
+                    .bytes
+                    .clone();
                 let spawned = thread::Builder::new()
                     .name("yank-clipboard-write".to_owned())
                     .spawn(move || {
@@ -414,16 +444,21 @@ impl State {
         }
     }
 
-    /// Takes the selection, serving `bytes` under every type in `mimes`.
-    fn offer(&mut self, qh: &QueueHandle<Self>, mimes: &[String], bytes: Payload) {
+    /// Takes the selection, serving every representation under its own
+    /// types. Nothing is taken for a selection with nothing to serve.
+    fn offer(&mut self, qh: &QueueHandle<Self>, serves: Vec<Serve>) {
+        if serves.is_empty() {
+            return;
+        }
+
         let source = self.manager.source(qh);
-        for mime in mimes {
+        for mime in serves.iter().flat_map(|serve| &serve.mimes) {
             source.offer(mime.clone());
         }
         source.offer(mime::MARKER.to_owned());
 
         self.device.set_selection(Some(&source));
-        if let Some(previous) = self.held.replace(Held { source, bytes }) {
+        if let Some(previous) = self.held.replace(Held { source, serves }) {
             previous.source.destroy();
         }
     }
@@ -448,21 +483,120 @@ impl State {
     }
 }
 
-/// Reads a transfer to its end, giving up past `limit` bytes.
-fn read_all(fd: OwnedFd, limit: usize) -> Result<Vec<u8>> {
-    let mut file = std::fs::File::from(fd);
-    let mut bytes = Vec::new();
-
-    // One byte past the limit is enough to know the transfer is too big.
-    let read = (&mut file)
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .wrap_err("the source stopped sending")?;
-    if read > limit {
-        return Err(eyre!("the selection is larger than the {limit} byte limit"));
+/// Reads every representation of a selection, best first, dropping the
+/// ones that do not fit `budget` bytes in total.
+///
+/// The pipes are drained together rather than one after another. The
+/// application on the other end writes them in whatever order it likes, so
+/// finishing one before starting the next would deadlock the moment it
+/// filled the pipe of a type we had not got to yet.
+///
+/// What is held stays within a chunk per representation of the budget:
+/// going past it drops the last one, which is the least useful, and
+/// repeats. Nothing at all comes back when the first representation is
+/// over the budget or never finishes, which is a selection that cannot be
+/// shared rather than one to share in part.
+fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
+    struct Reading {
+        mime: String,
+        /// Taken once the transfer ends, one way or another.
+        fd: Option<OwnedFd>,
+        /// Whether the source wrote all of it, which is the only case
+        /// worth keeping: half a payload is not a representation.
+        whole: bool,
+        bytes: Vec<u8>,
     }
 
-    Ok(bytes)
+    let mut reading: Vec<Reading> = pipes
+        .into_iter()
+        .map(|(mime, fd)| Reading {
+            mime,
+            fd: Some(fd),
+            whole: false,
+            bytes: Vec::new(),
+        })
+        .collect();
+    let mut chunk = vec![0u8; CHUNK];
+    let mut held = 0usize;
+    let deadline = Instant::now() + TRANSFER_TIMEOUT;
+
+    loop {
+        let open: Vec<usize> = (0..reading.len())
+            .filter(|index| reading[*index].fd.is_some())
+            .collect();
+        if open.is_empty() {
+            break;
+        }
+
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            debug!("giving up on {} unfinished clipboard transfers", open.len());
+            break;
+        };
+        let mut fds: Vec<PollFd> = open
+            .iter()
+            .map(|index| PollFd::new(reading[*index].fd.as_ref().unwrap(), PollFlags::IN))
+            .collect();
+        let left = Timespec {
+            tv_sec: left.as_secs().cast_signed(),
+            tv_nsec: left.subsec_nanos().into(),
+        };
+        match poll(&mut fds, Some(&left)) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(err) => {
+                debug!("cannot wait on the clipboard transfers: {err}");
+                break;
+            }
+        }
+
+        let ready: Vec<usize> = open
+            .iter()
+            .zip(&fds)
+            .filter(|(_, fd)| !fd.revents().is_empty())
+            .map(|(index, _)| *index)
+            .collect();
+        for index in ready {
+            let entry = &mut reading[index];
+            match rustix::io::read(entry.fd.as_ref().unwrap(), &mut chunk) {
+                Ok(0) => {
+                    entry.fd = None;
+                    entry.whole = true;
+                }
+                Ok(read) => {
+                    entry.bytes.extend_from_slice(&chunk[..read]);
+                    held += read;
+                }
+                Err(rustix::io::Errno::INTR) => {}
+                Err(err) => {
+                    debug!("cannot read the clipboard as {}: {err}", entry.mime);
+                    entry.fd = None;
+                    held -= entry.bytes.len();
+                    entry.bytes.clear();
+                }
+            }
+        }
+
+        while held > budget
+            && let Some(dropped) = reading.pop()
+        {
+            held -= dropped.bytes.len();
+        }
+        if reading.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    // The first type is what the entry *is*, so a selection that did not
+    // arrive under it is not this selection at all.
+    if !reading.first().is_some_and(|entry| entry.whole) {
+        return Vec::new();
+    }
+
+    reading
+        .into_iter()
+        .filter(|entry| entry.whole && !entry.bytes.is_empty())
+        .map(|entry| Rep::new(entry.mime, entry.bytes))
+        .collect()
 }
 
 /// Hands our bytes to a pasting application, ignoring the pipe closing

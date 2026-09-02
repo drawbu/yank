@@ -3,7 +3,7 @@
 //! [`state`] is the state machine that decides what the clipboard should
 //! hold; [`backend`] is what a platform has to answer to hold it, and
 //! [`wayland`] is the one that does; [`event`] is what machines send each
-//! other about it; [`mime`] is the policy for which representation of a
+//! other about it; [`mime`] is the policy for which representations of a
 //! selection to carry.
 //!
 //! The daemon side that ties them together lives in
@@ -22,6 +22,6 @@ pub mod state;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
-pub use backend::{Backend, Captured};
-pub use event::{Copy, Event};
+pub use backend::{Backend, Captured, Policy, Serve};
+pub use event::{Copy, Event, Rep, Selection};
 pub use state::{Clipboard, Effect, Item, Pause, Switch};

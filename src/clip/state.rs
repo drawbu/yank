@@ -30,13 +30,13 @@ use color_eyre::eyre::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    backend::Captured,
-    event::{Copy, Event},
+    backend::{Captured, Serve},
+    event::{Copy, Event, Rep, Selection},
     mime,
 };
 use crate::{
     config::Settings,
-    log::{Change, Entry, EntryId, Hlc, Limits, Log, Payload, Watermark, WireEntry},
+    log::{Change, Entry, EntryId, Hlc, Limits, Log, Watermark, WireEntry, payload},
     net::proto,
 };
 
@@ -50,8 +50,8 @@ pub enum Effect {
     Store(Entry),
     /// Remove this entry's file.
     Forget(EntryId),
-    /// Put these bytes on the local clipboard.
-    Apply { mimes: Vec<String>, bytes: Payload },
+    /// Put these representations of a selection on the local clipboard.
+    Apply(Vec<Serve>),
     /// Empty the local clipboard.
     ClearSelection,
 }
@@ -62,8 +62,9 @@ pub enum Effect {
 pub struct Item {
     pub id: EntryId,
     pub clock: Hlc,
+    /// The type the entry is named by; the rest are in the log.
     pub mime: String,
-    /// Size of the copied bytes.
+    /// What the entry weighs: every representation together.
     pub size: usize,
     pub secret: bool,
     /// When this entry disappears everywhere, if it was given a lifetime.
@@ -217,6 +218,16 @@ impl Clipboard {
         }
     }
 
+    /// The entry a caller named, or the selection when it named none.
+    pub fn named(&self, needle: Option<&str>) -> Result<&Item> {
+        match needle {
+            Some(needle) => self.resolve(needle),
+            None => self
+                .selection()
+                .ok_or_else(|| color_eyre::eyre::eyre!("the clipboard is empty")),
+        }
+    }
+
     /// The copied bytes of an entry, decoded from the log.
     pub fn body(&self, id: EntryId) -> Result<Copy> {
         let entry = self
@@ -232,24 +243,24 @@ impl Clipboard {
     /// Records something copied on this machine, from `yank copy`.
     ///
     /// Unlike [`Self::captured`] the bytes are not on the clipboard yet,
-    /// so this both shares them and puts them there.
+    /// so this both shares them and puts them there. `reps` is the
+    /// selection in every type it is being shared in, best first.
     pub fn copy(
         &mut self,
-        mime: String,
-        bytes: Vec<u8>,
+        selection: Selection,
         secret: bool,
         ttl: Option<Duration>,
     ) -> Result<(EntryId, Vec<Effect>)> {
-        ensure!(!bytes.is_empty(), "nothing to copy");
+        let size = selection.size();
+        ensure!(size > 0, "nothing to copy");
         ensure!(
-            bytes.len() <= self.settings.max_entry_bytes(),
+            size <= self.settings.max_entry_bytes(),
             "the selection is larger than the {} limit in config.toml",
             self.settings.max_entry_size,
         );
 
         let event = Event::Copy(Copy {
-            mime,
-            bytes,
+            selection,
             secret,
             ttl: self.lifetime(secret, ttl),
         });
@@ -264,23 +275,21 @@ impl Clipboard {
     /// as applied: putting them back would take the selection away from
     /// the application that owns it, for nothing.
     pub fn captured(&mut self, captured: Captured) -> Result<Vec<Effect>> {
-        let now = SystemTime::now();
-        if !self.pause.capture.is_on(now) || self.settings.is_ignored_mime(&captured.mime) {
+        if !self.pause.capture.is_on(SystemTime::now()) {
             return Ok(Vec::new());
         }
-        if captured.bytes.len() > self.settings.max_entry_bytes() {
-            tracing::debug!(
-                "ignoring a {} byte selection, over the configured limit",
-                captured.bytes.len(),
-            );
+        let Some(selection) = self.fit(captured.selection) else {
+            tracing::debug!("ignoring a selection over the configured limit");
             return Ok(Vec::new());
-        }
+        };
 
         // The clipboard already holding what the mesh selected is the
         // normal case after a restart, or after we applied an entry an
         // application then re-announced. Recording it again would put a
-        // duplicate in everyone's history on every restart.
-        let hash = hash(&captured.bytes);
+        // duplicate in everyone's history on every restart. The first
+        // representation is enough to tell: it is the one an application
+        // that re-announces our selection announces it under.
+        let hash = hash(&selection.primary.bytes);
         if let Some(current) = self.selection()
             && current.hash == hash
         {
@@ -289,8 +298,7 @@ impl Clipboard {
         }
 
         let event = Event::Copy(Copy {
-            mime: captured.mime,
-            bytes: captured.bytes,
+            selection,
             secret: captured.secret,
             ttl: self.lifetime(captured.secret, None),
         });
@@ -395,8 +403,13 @@ impl Clipboard {
     pub fn pick(&mut self, id: EntryId) -> Result<(EntryId, Vec<Effect>)> {
         let copy = self.body(id)?;
         let ttl = copy.ttl.map(u64::from).map(Duration::from_secs);
+        let secret = copy.secret;
+        // The new entry is ours, written under this machine's identity, so
+        // what it may claim is what this machine can back up: picking an
+        // entry copied elsewhere must not turn its paths into ours.
+        let selection = self.carried(copy, id);
 
-        self.copy(copy.mime, copy.bytes, copy.secret, ttl)
+        self.copy(selection, secret, ttl)
     }
 
     /// Empties the clipboard on every machine.
@@ -572,17 +585,14 @@ impl Clipboard {
             return Vec::new();
         }
 
-        match self.selection().map(|item| (item.id, item.mime.clone())) {
-            Some((id, mime)) if self.applied != Some(id) => {
+        match self.selection().map(|item| item.id) {
+            Some(id) if self.applied != Some(id) => {
                 let Ok(copy) = self.body(id) else {
                     return Vec::new();
                 };
                 self.applied = Some(id);
 
-                vec![Effect::Apply {
-                    mimes: mime::aliases(&mime),
-                    bytes: crate::log::payload(copy.bytes),
-                }]
+                vec![Effect::Apply(serves(&self.carried(copy, id)))]
             }
             None if self.applied.is_some() => {
                 self.applied = None;
@@ -594,7 +604,7 @@ impl Clipboard {
     }
 
     /// Builds the history entry for a copy, or `None` when its lifetime
-    /// has already run out.
+    /// has already run out and when it carries nothing at all.
     fn item(entry: &Entry, copy: &Copy) -> Option<Item> {
         let expires_at = copy.ttl.map(|ttl| {
             let ttl = Duration::from_secs(u64::from(ttl));
@@ -608,16 +618,50 @@ impl Clipboard {
             return None;
         }
 
+        let primary = &copy.selection.primary;
+
         Some(Item {
             id: entry.id,
             clock: entry.clock,
-            mime: copy.mime.clone(),
-            size: copy.bytes.len(),
+            mime: primary.mime.clone(),
+            size: copy.selection.size(),
             secret: copy.secret,
             expires_at,
-            preview: preview(&copy.mime, &copy.bytes, copy.secret),
-            hash: hash(&copy.bytes),
+            preview: preview(&primary.mime, &primary.bytes, copy.secret),
+            hash: hash(&primary.bytes),
         })
+    }
+
+    /// Whether an entry was copied on this machine.
+    pub fn is_local(&self, id: EntryId) -> bool {
+        id.origin == self.log.origin()
+    }
+
+    /// The representations of an entry that mean anything on this machine.
+    ///
+    /// A path is only true where the copying happened, so elsewhere what
+    /// is left of an entry that was one is the text of that path, which is
+    /// at least honest.
+    fn carried(&self, copy: Copy, id: EntryId) -> Selection {
+        if self.is_local(id) {
+            return copy.selection;
+        }
+
+        stripped(copy)
+    }
+
+    /// Drops the alternates that do not fit the entry cap, from the back,
+    /// since they arrive best first. Nothing fits when the primary alone
+    /// is over it: that is a selection too big to share, not one to share
+    /// in part.
+    fn fit(&self, mut selection: Selection) -> Option<Selection> {
+        let cap = self.settings.max_entry_bytes();
+        let mut size = selection.size();
+        while size > cap {
+            size -= selection.alternates.pop()?.bytes.len();
+        }
+
+        Some(selection)
     }
 
     /// The lifetime an entry gets: what was asked for, or the configured
@@ -627,6 +671,55 @@ impl Clipboard {
 
         Some(u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX))
     }
+}
+
+/// The same selection with its file references taken out: the paths in
+/// them are another machine's, and this one has nothing to resolve them
+/// against.
+///
+/// An entry that was nothing but paths keeps them as text, since a path is
+/// something a person can read, and `text/uri-list` is the one of those
+/// types that is nothing but paths.
+fn stripped(copy: Copy) -> Selection {
+    let (kept, paths): (Vec<Rep>, Vec<Rep>) = copy
+        .selection
+        .into_reps()
+        .partition(|rep| !mime::is_local(&rep.mime));
+    if let Some(selection) = Selection::new(kept) {
+        return selection;
+    }
+
+    let bytes = paths
+        .iter()
+        .find(|rep| rep.mime.eq_ignore_ascii_case(mime::URI_LIST))
+        .or(paths.first())
+        .expect("a selection carries at least one representation")
+        .bytes
+        .clone();
+
+    Selection::of(Rep::new(mime::PLAIN_TEXT, bytes))
+}
+
+/// What the compositor is handed for a selection: every representation
+/// under its own type, text under all of the names for text (see
+/// [`mime::aliases`]).
+fn serves(selection: &Selection) -> Vec<Serve> {
+    let mut serves: Vec<Serve> = Vec::new();
+    for rep in selection.reps() {
+        let mimes: Vec<String> = mime::aliases(&rep.mime)
+            .into_iter()
+            .filter(|mime| !serves.iter().any(|serve| serve.mimes.contains(mime)))
+            .collect();
+        if mimes.is_empty() {
+            continue;
+        }
+        serves.push(Serve {
+            mimes,
+            bytes: payload(rep.bytes.clone()),
+        });
+    }
+
+    serves
 }
 
 /// One line describing an entry, safe to print.
@@ -679,22 +772,21 @@ mod tests {
         Clipboard::new(log, settings, Pause::default())
     }
 
-    fn copy(board: &mut Clipboard, text: &str) -> Vec<Effect> {
-        board
-            .copy(
-                "text/plain".to_owned(),
-                text.as_bytes().to_vec(),
-                false,
-                None,
-            )
-            .unwrap()
-            .1
+    fn text(text: &str) -> Selection {
+        Selection::of(Rep::new("text/plain", text.as_bytes().to_vec()))
     }
 
-    fn captured(text: &str, secret: bool) -> Captured {
+    fn selection(reps: Vec<Rep>) -> Selection {
+        Selection::new(reps).unwrap()
+    }
+
+    fn copy(board: &mut Clipboard, contents: &str) -> Vec<Effect> {
+        board.copy(text(contents), false, None).unwrap().1
+    }
+
+    fn captured(contents: &str, secret: bool) -> Captured {
         Captured {
-            mime: "text/plain".to_owned(),
-            bytes: text.as_bytes().to_vec(),
+            selection: text(contents),
             secret,
         }
     }
@@ -712,12 +804,34 @@ mod tests {
         from.since(&to.have())
     }
 
+    /// The first representation of everything put on the clipboard.
     fn applied(effects: &[Effect]) -> Vec<String> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Apply { bytes, .. } => Some(String::from_utf8_lossy(bytes).into_owned()),
+                Effect::Apply(serves) => {
+                    Some(String::from_utf8_lossy(&serves[0].bytes).into_owned())
+                }
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// What one mutation put on the clipboard, by type.
+    fn served(effects: &[Effect]) -> Vec<(Vec<String>, String)> {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Apply(serves) => Some(serves),
+                _ => None,
+            })
+            .expect("nothing was put on the clipboard")
+            .iter()
+            .map(|serve| {
+                (
+                    serve.mimes.clone(),
+                    String::from_utf8_lossy(&serve.bytes).into_owned(),
+                )
             })
             .collect()
     }
@@ -901,12 +1015,7 @@ mod tests {
     fn a_lifetime_removes_the_entry_and_empties_the_clipboard() {
         let mut board = clipboard();
         board
-            .copy(
-                "text/plain".to_owned(),
-                b"a password".to_vec(),
-                true,
-                Some(Duration::from_secs(90)),
-            )
+            .copy(text("a password"), true, Some(Duration::from_secs(90)))
             .unwrap();
 
         let deadline = board.next_expiry().unwrap();
@@ -922,12 +1031,7 @@ mod tests {
         let mut board = clipboard();
         copy(&mut board, "something ordinary");
         board
-            .copy(
-                "text/plain".to_owned(),
-                b"a password".to_vec(),
-                true,
-                Some(Duration::from_secs(90)),
-            )
+            .copy(text("a password"), true, Some(Duration::from_secs(90)))
             .unwrap();
 
         let effects = board.expire(board.next_expiry().unwrap());
@@ -940,13 +1044,8 @@ mod tests {
     #[test]
     fn an_entry_whose_lifetime_ran_out_in_transit_never_lands() {
         let mut peer = clipboard();
-        peer.copy(
-            "text/plain".to_owned(),
-            b"a password".to_vec(),
-            true,
-            Some(Duration::from_secs(1)),
-        )
-        .unwrap();
+        peer.copy(text("a password"), true, Some(Duration::from_secs(1)))
+            .unwrap();
         let entries = wire(&peer);
 
         let mut board = clipboard();
@@ -1196,6 +1295,132 @@ mod tests {
         assert_eq!(previews(&board), vec!["first", "second", "first"]);
     }
 
+    /// What a browser copy is: the same selection twice over. Both reach
+    /// the compositor, and the plain one under every name for text.
+    #[test]
+    fn every_representation_reaches_the_clipboard() {
+        let mut board = clipboard();
+        let reps = selection(vec![
+            Rep::new("text/plain;charset=utf-8", b"hello".to_vec()),
+            Rep::new("text/html", b"<b>hello</b>".to_vec()),
+        ]);
+        let effects = board.copy(reps, false, None).unwrap().1;
+
+        let served = served(&effects);
+        assert_eq!(served.len(), 2);
+        assert!(served[0].0.contains(&"UTF8_STRING".to_owned()));
+        assert_eq!(served[0].1, "hello");
+        assert_eq!(served[1].0, vec!["text/html".to_owned()]);
+
+        let item = board.selection().unwrap();
+        assert_eq!(item.mime, "text/plain;charset=utf-8");
+        assert_eq!(item.size, 17);
+    }
+
+    #[test]
+    fn picking_an_entry_keeps_every_representation() {
+        let mut board = clipboard();
+        let reps = selection(vec![
+            Rep::new("text/plain", b"hello".to_vec()),
+            Rep::new("text/html", b"<b>hello</b>".to_vec()),
+        ]);
+        board.copy(reps, false, None).unwrap();
+        let first = board.selection().unwrap().id;
+        copy(&mut board, "something else");
+
+        let (_, effects) = board.pick(first).unwrap();
+        assert_eq!(served(&effects).len(), 2);
+    }
+
+    /// Copying a file copies its path, and a path belongs to the machine
+    /// it is on. Handing it back as a file reference anywhere else would
+    /// point a file manager at nothing, or at a different file.
+    #[test]
+    fn a_file_reference_is_only_offered_where_it_came_from() {
+        let mut peer = clipboard();
+        let reps = selection(vec![
+            Rep::new("text/uri-list", b"file:///home/x/y.iso\r\n".to_vec()),
+            Rep::new(
+                "x-special/gnome-copied-files",
+                b"cut\nfile:///home/x/y.iso".to_vec(),
+            ),
+        ]);
+        let effects = peer.copy(reps, false, None).unwrap().1;
+        assert_eq!(served(&effects)[0].0, vec!["text/uri-list".to_owned()]);
+
+        let mut board = clipboard();
+        let effects = board.accept(wire(&peer)).unwrap();
+
+        let served = served(&effects);
+        assert_eq!(served.len(), 1, "neither type survives the trip");
+        assert!(served[0].0.contains(&"text/plain".to_owned()));
+        assert_eq!(served[0].1, "file:///home/x/y.iso\r\n");
+    }
+
+    /// Picking writes the entry anew, under this machine's identity. What
+    /// it claims has to be what this machine can back up, so the paths of
+    /// a file copied elsewhere must not come back as a file reference.
+    #[test]
+    fn picking_a_file_copied_elsewhere_does_not_make_it_a_file_here() {
+        let mut peer = clipboard();
+        let reps = Selection::of(Rep::new("text/uri-list", b"file:///home/x/y.iso".to_vec()));
+        peer.copy(reps, false, None).unwrap();
+
+        let mut board = clipboard();
+        board.accept(wire(&peer)).unwrap();
+        let picked = board.selection().unwrap().id;
+        let (_, effects) = board.pick(picked).unwrap();
+
+        let served = served(&effects);
+        assert_eq!(served.len(), 1);
+        assert!(served[0].0.contains(&"text/plain".to_owned()));
+        assert!(!served[0].0.contains(&mime::URI_LIST.to_owned()));
+    }
+
+    /// A file manager offers what to do with the paths beside the paths
+    /// themselves. What survives on another machine is the paths.
+    #[test]
+    fn what_is_left_of_a_file_reference_is_the_paths_alone() {
+        let mut peer = clipboard();
+        let reps = selection(vec![
+            Rep::new(
+                "x-special/gnome-copied-files",
+                b"cut\nfile:///home/x/y.iso".to_vec(),
+            ),
+            Rep::new("text/uri-list", b"file:///home/x/y.iso".to_vec()),
+        ]);
+        peer.copy(reps, false, None).unwrap();
+
+        let mut board = clipboard();
+        let effects = board.accept(wire(&peer)).unwrap();
+
+        assert_eq!(served(&effects)[0].1, "file:///home/x/y.iso");
+    }
+
+    /// A selection whose alternates do not fit is still worth sharing.
+    /// What the cap takes is the alternates, from the back, rather than
+    /// the entry.
+    #[test]
+    fn what_does_not_fit_costs_the_alternates_not_the_entry() {
+        let mut board = settings_clipboard(Settings {
+            max_entry_size: bytesize::ByteSize::b(16),
+            ..Settings::default()
+        });
+        board
+            .captured(Captured {
+                selection: selection(vec![
+                    Rep::new("text/plain", b"hello".to_vec()),
+                    Rep::new("text/html", vec![b'x'; 32]),
+                ]),
+                secret: false,
+            })
+            .unwrap();
+
+        let item = board.selection().unwrap();
+        assert_eq!(item.mime, "text/plain");
+        assert_eq!(item.size, 5);
+    }
+
     #[test]
     fn oversized_selections_are_refused_locally() {
         let mut board = settings_clipboard(Settings {
@@ -1205,7 +1430,11 @@ mod tests {
 
         assert!(
             board
-                .copy("text/plain".to_owned(), vec![b'x'; 9], false, None)
+                .copy(
+                    Selection::of(Rep::new("text/plain", vec![b'x'; 9])),
+                    false,
+                    None
+                )
                 .is_err(),
         );
         assert!(
