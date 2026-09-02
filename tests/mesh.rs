@@ -11,7 +11,10 @@
 //! clipboard state machine does with a compositor is covered by the unit
 //! tests in `clip::state`.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use color_eyre::eyre::{Result, bail};
 use tempfile::TempDir;
@@ -19,7 +22,7 @@ use yank::{
     config::Dirs,
     daemon::{
         Daemon,
-        control::{CLIENT_TIMEOUT, Client, HistoryEntry, Request, Response},
+        control::{CLIENT_TIMEOUT, Client, FileInfo, HistoryEntry, Request, Response},
     },
     net::EndpointOptions,
 };
@@ -75,9 +78,15 @@ impl Machine {
 
     /// Sends one request, the way the CLI does.
     async fn ask(&self, request: &Request) -> Result<Response> {
+        self.ask_within(request, CLIENT_TIMEOUT).await
+    }
+
+    /// The same, for a request the daemon answers only once something has
+    /// happened.
+    async fn ask_within(&self, request: &Request, within: Duration) -> Result<Response> {
         Client::connect_required(&self.dirs)
             .await?
-            .request(request, CLIENT_TIMEOUT)
+            .request(request, within)
             .await
     }
 
@@ -98,6 +107,42 @@ impl Machine {
     async fn history(&self) -> Result<Vec<HistoryEntry>> {
         match self.ask(&Request::History { limit: None }).await? {
             Response::History(entries) => Ok(entries),
+            other => bail!("unexpected answer: {other:?}"),
+        }
+    }
+
+    /// Copies files on this machine, contents and all.
+    async fn copy_files(&self, paths: &[PathBuf]) -> Result<String> {
+        let paths = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+
+        match self
+            .ask(&Request::CopyFiles {
+                paths,
+                ttl_secs: None,
+            })
+            .await?
+        {
+            Response::Wrote { label } => Ok(label),
+            other => bail!("unexpected answer: {other:?}"),
+        }
+    }
+
+    /// Where the files of an entry are on this machine. Asking is what
+    /// makes the daemon go and get them, and the answer is what waits.
+    async fn files(&self, entry: Option<&str>) -> Result<(Option<PathBuf>, Vec<FileInfo>)> {
+        match self
+            .ask_within(
+                &Request::Files {
+                    entry: entry.map(str::to_owned),
+                },
+                SETTLE,
+            )
+            .await?
+        {
+            Response::Files { tree, files, .. } => Ok((tree.map(PathBuf::from), files)),
             other => bail!("unexpected answer: {other:?}"),
         }
     }
@@ -382,6 +427,110 @@ async fn a_restarted_machine_keeps_its_history() -> Result<()> {
     let history = machine.history().await?;
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].preview, "written before the restart");
+
+    Ok(())
+}
+
+/// The whole point of carrying files rather than paths: what the second
+/// machine gets is the bytes, under the names they had, and not a path
+/// into a filesystem it does not have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> Result<()> {
+    let (first, second) = mesh().await?;
+
+    let source = tempfile::tempdir()?;
+    std::fs::create_dir_all(source.path().join("folder/deep"))?;
+    std::fs::write(source.path().join("folder/one.txt"), b"the first file")?;
+    std::fs::write(
+        source.path().join("folder/deep/two.bin"),
+        vec![7u8; 300_000],
+    )?;
+    let loose = source.path().join("loose.txt");
+    std::fs::write(&loose, b"on its own")?;
+
+    let label = first
+        .copy_files(&[source.path().join("folder"), loose])
+        .await?;
+
+    eventually("the entry to arrive", || async {
+        Ok(second.history().await?.iter().any(|entry| entry.files == 3))
+    })
+    .await;
+
+    // Asking is what sets the fetch going, and the answer is what waits
+    // for it: the daemon holds the request until the files are laid out.
+    let (tree, files) = second.files(Some(&label)).await?;
+    let tree = tree.expect("the answer waits for them");
+
+    let names: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["folder/deep/two.bin", "folder/one.txt", "loose.txt"],
+    );
+    assert_eq!(
+        std::fs::read(tree.join("folder/one.txt"))?,
+        b"the first file",
+    );
+    assert_eq!(
+        std::fs::read(tree.join("folder/deep/two.bin"))?,
+        vec![7u8; 300_000],
+    );
+    assert_eq!(std::fs::read(tree.join("loose.txt"))?, b"on its own");
+
+    Ok(())
+}
+
+/// The source is not read again at paste time, so what arrives is what was
+/// copied, whatever happened to the original in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_arrives_is_what_was_copied_and_not_what_the_file_became() -> Result<()> {
+    let (first, second) = mesh().await?;
+
+    let source = tempfile::tempdir()?;
+    let path = source.path().join("notes.txt");
+    std::fs::write(&path, b"as it was")?;
+
+    let label = first.copy_files(std::slice::from_ref(&path)).await?;
+    std::fs::write(&path, b"edited afterwards")?;
+
+    eventually("the entry to arrive", || async {
+        Ok(second.history().await?.iter().any(|it| it.label == label))
+    })
+    .await;
+
+    let (tree, _) = second.files(Some(&label)).await?;
+    assert_eq!(
+        std::fs::read(tree.unwrap().join("notes.txt"))?,
+        b"as it was",
+    );
+
+    Ok(())
+}
+
+/// An entry that leaves the history takes its files with it: they are
+/// clipboard contents, and they sit on the disk in the clear.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_an_entry_drops_its_files() -> Result<()> {
+    let (first, second) = mesh().await?;
+
+    let source = tempfile::tempdir()?;
+    let path = source.path().join("secret.txt");
+    std::fs::write(&path, b"nothing to see")?;
+    let label = first.copy_files(std::slice::from_ref(&path)).await?;
+
+    eventually("the entry to arrive", || async {
+        Ok(second.history().await?.iter().any(|it| it.label == label))
+    })
+    .await;
+    let (tree, _) = second.files(Some(&label)).await?;
+    let tree = tree.expect("the answer waits for them");
+
+    first.ask(&Request::Forget { entry: label }).await?;
+    eventually("the files to go", || async { Ok(!tree.exists()) }).await;
+
+    let spool = second.dirs.files_dir().join("blobs");
+    let left = std::fs::read_dir(spool)?.count();
+    assert_eq!(left, 0, "the content of a forgotten entry stays on disk");
 
     Ok(())
 }
