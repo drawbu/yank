@@ -236,17 +236,14 @@ async fn materialize(
     if files.is_empty() {
         return Ok(());
     }
+    let total = files::total(&files)?;
     ensure!(
-        files::total(&files)? <= settings.max_file_bytes(),
+        total <= settings.max_file_bytes(),
         "it is over the {} limit in config.toml",
         settings.max_file_size,
     );
     files::validate(&files)?;
-    room(
-        &spool.store,
-        files::total(&files)?,
-        settings.file_budget.as_u64(),
-    )?;
+    room(&spool.store, total, settings.file_budget.as_u64())?;
 
     let mut backoff = Backoff::new(RETRY_MIN, RETRY_MAX);
     for attempt in 1..=RETRIES {

@@ -69,9 +69,7 @@ struct Persisted {
 #[derive(Clone, Debug)]
 pub enum BackendState {
     Running,
-    /// No compositor, or one without the data-control protocol. The daemon
-    /// keeps replicating; `yank copy` and `yank paste` keep working. This
-    /// is the normal state on a machine with no graphical session.
+    /// No compositor or compatible data-control protocol is available.
     Down(String),
 }
 
@@ -395,7 +393,7 @@ impl ClipService {
         self.board.lock().unwrap().pause()
     }
 
-    /// Whether the compositor side is up, and why not when it is not.
+    /// Whether the compositor side is running, and why not when it is not.
     pub fn backend_state(&self) -> BackendState {
         match self.down.lock().unwrap().clone() {
             Some(reason) => BackendState::Down(reason),

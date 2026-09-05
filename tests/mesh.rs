@@ -27,11 +27,8 @@ use yank::{
     net::EndpointOptions,
 };
 
-/// How long a test waits for something to reach the other machine before
-/// calling it a failure.
 const SETTLE: Duration = Duration::from_secs(20);
 
-/// One machine of the test mesh.
 struct Machine {
     dirs: Dirs,
     daemon: Option<Daemon>,
@@ -41,8 +38,6 @@ struct Machine {
 }
 
 impl Machine {
-    /// Starts a machine on a fresh directory, reachable by the others
-    /// sharing `lookup`.
     async fn start(lookup: &iroh::address_lookup::MemoryLookup) -> Result<Self> {
         let home = tempfile::tempdir()?;
         let dirs = Dirs::new(Some(home.path().to_owned()))?;
@@ -61,14 +56,12 @@ impl Machine {
         })
     }
 
-    /// Stops the daemon, leaving everything it wrote on disk.
     async fn stop(&mut self) {
         if let Some(daemon) = self.daemon.take() {
             daemon.shutdown().await;
         }
     }
 
-    /// Starts the daemon again on the same directory.
     async fn restart(&mut self) -> Result<()> {
         self.stop().await;
         self.daemon = Some(Daemon::start(&self.dirs, &self.options).await?);
@@ -76,7 +69,6 @@ impl Machine {
         Ok(())
     }
 
-    /// Sends one request, the way the CLI does.
     async fn ask(&self, request: &Request) -> Result<Response> {
         self.ask_within(request, CLIENT_TIMEOUT).await
     }
@@ -90,7 +82,6 @@ impl Machine {
             .await
     }
 
-    /// Copies something on this machine.
     async fn copy(&self, text: &str) -> Result<()> {
         self.ask(&Request::Copy {
             mime: "text/plain".to_owned(),
@@ -103,7 +94,6 @@ impl Machine {
         Ok(())
     }
 
-    /// The history, newest first.
     async fn history(&self) -> Result<Vec<HistoryEntry>> {
         match self.ask(&Request::History { limit: None }).await? {
             Response::History(entries) => Ok(entries),
@@ -111,7 +101,6 @@ impl Machine {
         }
     }
 
-    /// Copies files on this machine, contents and all.
     async fn copy_files(&self, paths: &[PathBuf]) -> Result<String> {
         let paths = paths
             .iter()
@@ -147,7 +136,6 @@ impl Machine {
         }
     }
 
-    /// What this machine would paste, or `None` when nothing is selected.
     async fn selection(&self) -> Result<Option<String>> {
         Ok(self
             .history()
@@ -213,7 +201,6 @@ where
     }
 }
 
-/// Two paired machines, ready to use.
 async fn mesh() -> Result<(Machine, Machine)> {
     let lookup = iroh::address_lookup::MemoryLookup::default();
     let first = Machine::start(&lookup).await?;

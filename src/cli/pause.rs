@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use clap::Args;
 use color_eyre::eyre::{Result, bail};
 
-use super::ui;
+use super::{parse_duration, ui};
 use crate::{
     clip::{Pause, Switch},
     config::Dirs,
@@ -109,8 +109,4 @@ fn resumes(switch: Switch, now: SystemTime) -> String {
         ),
         _ => String::new(),
     }
-}
-
-fn parse_duration(text: &str) -> Result<Duration, String> {
-    humantime::parse_duration(text).map_err(|err| err.to_string())
 }

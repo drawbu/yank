@@ -53,8 +53,7 @@ impl Client {
         }
     }
 
-    /// Connects, failing with [`DaemonNotRunning`] when none is. Every
-    /// command goes through here, so they all fail the same way.
+    /// Connects, failing with [`DaemonNotRunning`] when none is listening.
     pub async fn connect_required(dirs: &Dirs) -> Result<Self> {
         Self::connect(dirs)
             .await?
@@ -77,8 +76,7 @@ impl Client {
     }
 }
 
-/// Runs one exchange with the daemon on a runtime of its own: the CLI is
-/// otherwise a synchronous program and has no reason to keep one around.
+/// Runs a control operation on a current-thread Tokio runtime.
 pub fn talk<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

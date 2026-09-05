@@ -1,11 +1,4 @@
-//! The `yank` command.
-//!
-//! Every command is a request to the daemon over the control socket: the
-//! daemon is the one holding the clipboard, the identity key and the mesh
-//! state, and having the CLI touch any of them behind its back is how two
-//! writers of the same file start disagreeing. The only exceptions are
-//! `yank service`, which manages the daemon itself, and `yank daemon`,
-//! which *is* the daemon.
+//! Command-line interface.
 
 mod clip;
 mod daemon;
@@ -15,7 +8,7 @@ mod service;
 mod status;
 mod ui;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 use color_eyre::eyre::Result;
@@ -107,6 +100,10 @@ pub fn report_error(err: &color_eyre::Report) {
     };
 
     anstream::eprintln!("{}", ui::bad(message));
+}
+
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    humantime::parse_duration(text).map_err(|err| err.to_string())
 }
 
 /// This machine's hostname: the name it offers the mesh by default.

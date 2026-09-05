@@ -811,17 +811,11 @@ fn rehomed(copy: &Copy, tree: &Path) -> Selection {
     selection.alternates.extend(
         copy.selection
             .reps()
-            .filter(|rep| !names_a_path(&rep.mime))
+            .filter(|rep| !mime::is_local(&rep.mime) && !mime::is_text(&rep.mime))
             .cloned(),
     );
 
     selection
-}
-
-/// Whether a representation of a selection that names files is one saying
-/// where those files are, and is therefore only true where they sit.
-fn names_a_path(mime: &str) -> bool {
-    mime::is_local(mime) || mime::is_text(mime)
 }
 
 /// What the compositor is handed for a selection: every representation
@@ -967,13 +961,6 @@ mod tests {
             .collect()
     }
 
-    fn stored(effects: &[Effect]) -> usize {
-        effects
-            .iter()
-            .filter(|effect| matches!(effect, Effect::Store(_)))
-            .count()
-    }
-
     fn previews(board: &Clipboard) -> Vec<String> {
         board
             .history()
@@ -988,7 +975,13 @@ mod tests {
         let effects = copy(&mut board, "hello");
 
         assert_eq!(applied(&effects), vec!["hello"]);
-        assert_eq!(stored(&effects), 1);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::Store(_)))
+                .count(),
+            1
+        );
         assert_eq!(board.selection().unwrap().preview, "hello");
     }
 

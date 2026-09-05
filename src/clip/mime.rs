@@ -1,4 +1,4 @@
-//! Which mime types to take, and which ones to offer back.
+//! Mime selection policy.
 //!
 //! A clipboard selection is offered under several mime types at once, and
 //! which one gets pasted is the pasting application's choice: a browser
@@ -87,8 +87,6 @@ const CHATTER: &[&str] = &[
 /// representation of it: dropping only that one would share the same
 /// selection under its next type.
 ///
-/// A bounded number of types come back, since an application is free to
-/// advertise as many as it likes.
 pub fn select<'a>(offered: &'a [String], ignore: &[String]) -> Vec<&'a str> {
     let ignored = |mime: &str| ignore.iter().any(|name| name == mime);
 

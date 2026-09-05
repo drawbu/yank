@@ -149,17 +149,11 @@ fn prepare(dir: &Path) -> Result<()> {
                 meta.version,
             );
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound && dir.exists() => {
-            // Version zero had no schema marker. It cannot be decoded after
-            // the Copy payload changed, so start this one cleanly.
-            fs::remove_dir_all(dir).wrap_err_with(|| format!("cannot clear {}", dir.display()))?;
-            crate::config::create_private(dir)?;
-            crate::config::write_private(
-                &meta,
-                &serde_json::to_vec_pretty(&Meta { version: VERSION })?,
-            )?;
-        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if dir.exists() {
+                fs::remove_dir_all(dir)
+                    .wrap_err_with(|| format!("cannot clear {}", dir.display()))?;
+            }
             crate::config::create_private(dir)?;
             crate::config::write_private(
                 &meta,

@@ -223,10 +223,6 @@ mod tests {
         assert_eq!(copy.ttl, Some(90));
     }
 
-    /// What the split buys: "a selection carries at least one
-    /// representation" is a fact rather than a comment, here and on the
-    /// wire alike, so nothing downstream has to answer for an entry that
-    /// carries none.
     #[test]
     fn a_selection_with_no_representation_cannot_be_built() {
         assert!(Selection::new(Vec::new()).is_none());

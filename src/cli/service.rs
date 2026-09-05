@@ -167,8 +167,6 @@ fn install(dirs: &Dirs, program: Option<PathBuf>) -> Result<()> {
         command.push("--dir".to_owned());
         command.push(quote(dirs.config_root().as_os_str())?);
     }
-    command.push("daemon".to_owned());
-
     let path = unit_path()?;
     let parent = path.parent().expect("the unit path has a directory");
     std::fs::create_dir_all(parent)

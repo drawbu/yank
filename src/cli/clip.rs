@@ -10,7 +10,7 @@ use std::{
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
-use super::ui;
+use super::{parse_duration, ui};
 use crate::{
     clip::mime::PLAIN_TEXT,
     config::Dirs,
@@ -398,11 +398,6 @@ fn preview(entry: &HistoryEntry) -> String {
         ),
         None => preview,
     }
-}
-
-/// Parses `--ttl`, accepting what `humantime` accepts: `90s`, `5m`, `1h`.
-fn parse_duration(text: &str) -> Result<Duration, String> {
-    humantime::parse_duration(text).map_err(|err| err.to_string())
 }
 
 fn unexpected(response: &Response) -> Result<()> {

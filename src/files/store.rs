@@ -111,11 +111,7 @@ impl Store {
         self.trees.join(id.label())
     }
 
-    /// Takes a file into the spool, returning what it turned out to be.
-    ///
-    /// The copy is made first and hashed afterwards, off the copy: hashing
-    /// the original and copying it after would name content that the file
-    /// no longer has if it changed in between.
+    /// Takes a snapshot of a file into the spool without reserving it against a sweep.
     pub fn take(&self, source: &Path) -> Result<(Hash, u64)> {
         self.take_inner(source, false)
     }
