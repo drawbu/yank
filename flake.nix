@@ -38,24 +38,30 @@
           self',
           ...
         }:
-        {
-          packages.default = self'.packages.yank;
-          packages.yank = pkgs.rustPlatform.buildRustPackage {
+        let
+          gitRev = self.rev or self.dirtyRev or null;
+          packageVersion = (lib.importTOML ./Cargo.toml).package.version;
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+              ./tests
+            ];
+          };
+          yank = pkgs.rustPlatform.buildRustPackage {
             pname = "yank";
-            version = (lib.importTOML ./Cargo.toml).package.version;
+            version = "${packageVersion}-unstable-${if gitRev != null then gitRev else "dirty"}";
 
-            src = lib.fileset.toSource {
-              root = ./.;
-              fileset = lib.fileset.unions [
-                ./Cargo.toml
-                ./Cargo.lock
-                ./src
-                ./tests
-              ];
-            };
+            inherit src;
             cargoLock.lockFile = ./Cargo.lock;
 
             useNextest = true;
+
+            env = {
+              NIX_YANK_GIT_HASH = gitRev;
+            };
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
             postInstall = ''
@@ -72,6 +78,11 @@
               platforms = lib.platforms.linux;
             };
           };
+        in
+        {
+
+          packages.default = self'.packages.yank;
+          packages.yank = yank;
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [

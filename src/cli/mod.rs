@@ -35,7 +35,7 @@ use crate::config::Dirs;
 ///
 /// Use `yank status` to see the machines and what the clipboard holds.
 #[derive(Debug, Parser)]
-#[command(name = "yank", version, verbatim_doc_comment)]
+#[command(name = "yank", version = crate::VERSION.as_str(), verbatim_doc_comment)]
 pub struct Cli {
     /// Directory holding the configuration, state and socket
     ///

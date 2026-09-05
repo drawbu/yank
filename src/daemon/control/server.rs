@@ -268,7 +268,7 @@ fn status(ctx: &Context) -> Status {
     Status {
         endpoint: ctx.endpoint.secret_key().public(),
         uptime_secs: ctx.started.elapsed().unwrap_or_default().as_secs(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: crate::VERSION.to_string(),
         clipboard: ClipboardStatus {
             backend: match clip.backend_state() {
                 BackendState::Running => None,
