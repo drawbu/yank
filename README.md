@@ -122,6 +122,16 @@ See [iroh's Security & Privacy](https://docs.iroh.computer/concepts/security-pri
 Non-secret history and copied files are stored in `~/.local/state/yank` in
 plain.
 
+## Contributing
+
+Contributions and bug reports are welcome and appreciated. Feature requests are
+welcome too, but may not be accepted: this project follows its maintainer's
+direction, and it cannot maintain every possible feature.
+
+AI-generated code is welcome, but you must disclose it. You remain responsible
+for everything you submit. Undisclosed AI use or AI-written prose is slop and
+will be discarded immediately.
+
 ## Acknowledgements
 
 [jj-mesh](https://github.com/baptiste0928/jj-mesh) gave me the idea of this
