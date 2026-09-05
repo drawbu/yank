@@ -22,7 +22,7 @@ pub struct DaemonNotRunning;
 
 impl std::fmt::Display for DaemonNotRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The yank daemon is not running. Start it with `yank service install`.")
+        f.write_str("The yank daemon is not running. Start it with `yank service start`.")
     }
 }
 
