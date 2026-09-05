@@ -83,6 +83,10 @@
 
           packages.default = self'.packages.yank;
           packages.yank = yank;
+          packages.yank-stable = yank.overrideAttrs {
+            __intentionallyOverridingVersion = true;
+            version = packageVersion;
+          };
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
