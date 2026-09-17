@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::mpsc as tokio_mpsc;
 use wayland_client::{

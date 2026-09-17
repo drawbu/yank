@@ -6,7 +6,6 @@
 use clap::Args;
 
 use crate::{config::Dirs, daemon};
-use color_eyre::eyre;
 
 /// Run the daemon in the foreground
 #[derive(Debug, Args)]

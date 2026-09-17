@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
@@ -315,7 +315,7 @@ impl ClipService {
 
         let rep = match mime {
             Some(mime) => copy.selection.rep(mime).ok_or_else(|| {
-                color_eyre::eyre::eyre!(
+                eyre::eyre!(
                     "entry {id} has no {} in it; it has {}",
                     crate::config::sanitize(mime),
                     copy.selection

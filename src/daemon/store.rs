@@ -14,7 +14,6 @@ use crate::{
     config::{Dirs, MeshState},
     net::pair,
 };
-use color_eyre::eyre;
 
 /// The mesh state and everything a change to it has to reach.
 #[derive(Debug)]

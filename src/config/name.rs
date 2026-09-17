@@ -5,8 +5,6 @@
 //! in length and stripped of characters that could hide or reorder what the
 //! user sees.
 
-use color_eyre::eyre;
-
 /// Maximum length of a machine name, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
 

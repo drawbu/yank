@@ -6,7 +6,7 @@
 //! accept, because on an unauthenticated stream the prefix is written by
 //! whoever is on the other end.
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 

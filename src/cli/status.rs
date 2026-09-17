@@ -1,7 +1,6 @@
 //! `yank status`: what the daemon is doing.
 
 use clap::Args;
-use color_eyre::eyre;
 
 use super::{pause, ui};
 use crate::{

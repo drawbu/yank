@@ -16,7 +16,6 @@ use crate::{
     log::{Watermark, WireEntry},
     net::proto::{self, Topic},
 };
-use color_eyre::eyre;
 
 /// Every replicated feature this daemon runs.
 #[derive(Debug)]

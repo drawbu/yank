@@ -36,7 +36,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -249,7 +248,7 @@ impl Clipboard {
             Some(needle) => self.resolve(needle),
             None => self
                 .selection()
-                .ok_or_else(|| color_eyre::eyre::eyre!("the clipboard is empty")),
+                .ok_or_else(|| eyre::eyre!("the clipboard is empty")),
         }
     }
 
@@ -258,7 +257,7 @@ impl Clipboard {
         let entry = self
             .log
             .get(id)
-            .ok_or_else(|| color_eyre::eyre::eyre!("entry {id} is gone"))?;
+            .ok_or_else(|| eyre::eyre!("entry {id} is gone"))?;
         match Event::decode(&entry.payload)? {
             Event::Copy(copy) => Ok(copy),
             _ => eyre::bail!("entry {id} is not a copied selection"),

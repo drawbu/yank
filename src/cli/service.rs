@@ -21,7 +21,7 @@ use std::{
 };
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 
 use super::ui;
 use crate::config::{Dirs, ServiceState};
@@ -269,7 +269,7 @@ fn unit(command: &str) -> String {
 fn quote(arg: &OsStr) -> eyre::Result<String> {
     let text = arg
         .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("{arg:?} is not valid UTF-8"))?;
+        .ok_or_else(|| eyre::eyre!("{arg:?} is not valid UTF-8"))?;
     eyre::ensure!(
         !text.chars().any(char::is_control),
         "{arg:?} contains control characters, which a unit file cannot hold",

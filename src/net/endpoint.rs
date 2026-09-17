@@ -3,7 +3,6 @@
 use iroh::{Endpoint, endpoint::presets};
 
 use crate::config::MachineKey;
-use color_eyre::eyre;
 
 /// How the endpoint reaches the network.
 #[derive(Debug, Clone, Default)]

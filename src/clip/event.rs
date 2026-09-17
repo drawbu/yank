@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use serde::{Deserialize, Serialize};
 
 use super::mime;

@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::{
     sync::{Semaphore, mpsc},
@@ -190,7 +190,7 @@ pub fn take_all(
     let wanted = sources.iter().try_fold(0u64, |total, source| {
         total
             .checked_add(source.size)
-            .ok_or_else(|| color_eyre::eyre::eyre!("the selection is too large to share"))
+            .ok_or_else(|| eyre::eyre!("the selection is too large to share"))
     })?;
     room(store, wanted, budget)?;
 
@@ -340,7 +340,7 @@ async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> eyre::Re
             incoming.write(&chunk)?;
         }
 
-        Ok::<_, color_eyre::Report>(incoming)
+        Ok::<_, eyre::Report>(incoming)
     });
 
     let mut left = size;
@@ -357,7 +357,7 @@ async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> eyre::Re
                 chunks
                     .send(chunk[..read].to_vec())
                     .await
-                    .map_err(|_| color_eyre::eyre::eyre!("cannot write the transfer"))?;
+                    .map_err(|_| eyre::eyre!("cannot write the transfer"))?;
             }
         }
     }

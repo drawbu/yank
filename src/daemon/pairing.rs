@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre;
 use iroh::{Endpoint, endpoint::Connection};
 use tokio::sync::Semaphore;
 

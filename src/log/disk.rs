@@ -16,7 +16,7 @@ use std::{
     thread,
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use serde::{Deserialize, Serialize};
 
 use super::{Entry, EntryId, WireEntry};
@@ -91,7 +91,7 @@ impl Writer {
             }
 
             match fs::read(&path)
-                .map_err(color_eyre::Report::from)
+                .map_err(eyre::Report::from)
                 .and_then(|bytes| postcard::from_bytes(&bytes).wrap_err("cannot decode the entry"))
             {
                 Ok(entry) => entries.push(entry),

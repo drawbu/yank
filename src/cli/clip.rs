@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Args;
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 
 use super::{parse_duration, ui};
 use crate::{

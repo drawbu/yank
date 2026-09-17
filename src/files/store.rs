@@ -25,7 +25,7 @@ use std::{
     sync::Mutex,
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use walkdir::WalkDir;
 
 use super::{FileRef, Hash};
@@ -332,7 +332,7 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> eyre::Result
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or_else(|| {
-                    color_eyre::eyre::eyre!(
+                    eyre::eyre!(
                         "{} has a name that cannot be shared",
                         entry.path().display(),
                     )
@@ -344,7 +344,7 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> eyre::Result
 
             total = total
                 .checked_add(size)
-                .ok_or_else(|| color_eyre::eyre::eyre!("the selection is too large to share"))?;
+                .ok_or_else(|| eyre::eyre!("the selection is too large to share"))?;
             eyre::ensure!(found.len() < max_files, "the selection has too many files");
             eyre::ensure!(total <= max_bytes, "the selection is too large to share");
             found.push(Source {

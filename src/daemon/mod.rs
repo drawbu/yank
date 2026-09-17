@@ -37,7 +37,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre;
 use iroh::{Endpoint, EndpointId};
 use tokio::sync::{Semaphore, mpsc};
 
@@ -184,7 +183,7 @@ impl Daemon {
     /// Resolves when a subsystem stops on its own, which is always fatal:
     /// it would leave a daemon that looks alive but no longer answers the
     /// socket, or no longer accepts connections.
-    pub async fn failed(&mut self) -> color_eyre::Report {
+    pub async fn failed(&mut self) -> eyre::Report {
         let outcome = self.tasks.join_next().await;
 
         eyre::eyre!("a daemon subsystem stopped unexpectedly: {outcome:?}")

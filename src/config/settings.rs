@@ -11,7 +11,7 @@
 use std::{fs, io::ErrorKind, time::Duration};
 
 use bytesize::ByteSize;
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use serde::Deserialize;
 
 use super::Dirs;

@@ -32,7 +32,6 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::event::Selection;
 use crate::log::Payload;
-use color_eyre::eyre;
 
 /// What the daemon asks a backend to do.
 #[derive(Debug)]
@@ -117,6 +116,6 @@ pub fn connect(events: &UnboundedSender<Event>, policy: Policy) -> eyre::Result<
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (events, policy);
-        color_eyre::eyre::bail!("yank has no clipboard backend for this platform yet")
+        eyre::bail!("yank has no clipboard backend for this platform yet")
     }
 }

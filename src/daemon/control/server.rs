@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use iroh::Endpoint;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -168,7 +168,7 @@ async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
             let joining = pair::join(&ctx.endpoint, &ticket, &name, &state);
             let peer = tokio::time::timeout(PAIRING_TIMEOUT, joining)
                 .await
-                .map_err(|_| color_eyre::eyre::eyre!("pairing timed out"))??;
+                .map_err(|_| eyre::eyre!("pairing timed out"))??;
             ctx.store.add_paired(&peer)?;
 
             Ok(Response::Paired {

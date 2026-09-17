@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use color_eyre::eyre;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 

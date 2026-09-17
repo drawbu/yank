@@ -30,7 +30,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre;
 use data_encoding::HEXLOWER;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 use serde::{Deserialize, Serialize};
@@ -128,7 +127,7 @@ pub fn total(files: &[FileRef]) -> eyre::Result<u64> {
     files.iter().try_fold(0u64, |total, file| {
         total
             .checked_add(file.size)
-            .ok_or_else(|| color_eyre::eyre::eyre!("the file manifest is too large"))
+            .ok_or_else(|| eyre::eyre!("the file manifest is too large"))
     })
 }
 

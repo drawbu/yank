@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
 use etcetera::BaseStrategy as _;
+use eyre::WrapErr as _;
 
 /// The resolved directories of one `yank` installation.
 #[derive(Clone, Debug)]

@@ -13,7 +13,7 @@
 
 use std::{cmp, collections::BTreeMap, fs, io::ErrorKind};
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 

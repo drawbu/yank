@@ -33,7 +33,6 @@ use crate::{
     files::Hash,
     log::{MAX_ENTRY_BYTES, Watermark, WireEntry},
 };
-use color_eyre::eyre;
 
 /// ALPN of the replication protocol. Bumped whenever the wire format
 /// changes, so mismatched daemons refuse each other instead of

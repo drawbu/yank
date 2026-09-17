@@ -23,8 +23,8 @@
 
 use std::{fmt, str::FromStr, time::Duration};
 
-use color_eyre::eyre::{self, WrapErr as _};
 use data_encoding::BASE32_NOPAD;
+use eyre::WrapErr as _;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{Connection, ConnectionError, SendStream, VarInt},
@@ -97,7 +97,7 @@ impl fmt::Display for PairTicket {
 }
 
 impl FromStr for PairTicket {
-    type Err = color_eyre::eyre::Error;
+    type Err = eyre::Error;
 
     fn from_str(s: &str) -> eyre::Result<Self> {
         let encoded = s

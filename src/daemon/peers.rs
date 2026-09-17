@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use iroh::{
     Endpoint, EndpointId, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream},

@@ -13,7 +13,6 @@ use std::{path::PathBuf, time::Duration};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 
 use crate::config::Dirs;
-use color_eyre::eyre;
 
 /// A peer-to-peer clipboard daemon
 ///
@@ -92,7 +91,7 @@ pub fn run() -> eyre::Result<()> {
 
 /// Prints a failure. The expected "no daemon" case prints as a plain
 /// sentence: not having started it yet is not a bug to report.
-pub fn report_error(err: &color_eyre::Report) {
+pub fn report_error(err: &eyre::Report) {
     let message = if err.is::<crate::daemon::control::DaemonNotRunning>() {
         format!("{err:#}")
     } else {

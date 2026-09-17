@@ -16,7 +16,6 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre;
 use tempfile::TempDir;
 use yank::{
     config::Dirs,

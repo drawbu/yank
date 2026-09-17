@@ -10,8 +10,8 @@ use std::{
     path::Path,
 };
 
-use color_eyre::eyre::{self, WrapErr as _};
 use data_encoding::BASE64;
+use eyre::WrapErr as _;
 use iroh::{EndpointId, SecretKey};
 
 use super::Dirs;

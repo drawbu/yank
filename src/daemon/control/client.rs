@@ -2,7 +2,7 @@
 
 use std::{future::Future, io, time::Duration};
 
-use color_eyre::eyre::{self, WrapErr as _};
+use eyre::WrapErr as _;
 use tokio::net::UnixStream;
 
 use super::protocol::{MAX_MESSAGE_SIZE, Request, Response};

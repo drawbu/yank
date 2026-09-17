@@ -7,7 +7,6 @@
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use color_eyre::eyre;
 
 use super::{parse_duration, ui};
 use crate::{

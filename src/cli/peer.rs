@@ -5,7 +5,6 @@
 //! its own once the other machine redeems it.
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre;
 
 use super::{hostname, ui};
 use crate::{

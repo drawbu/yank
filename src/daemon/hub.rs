@@ -187,7 +187,7 @@ async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
             let mut stream = conn.open_uni().await?;
             crate::net::wire::write_message(&mut stream, &message, proto::MAX_UNI_SIZE).await?;
             stream.finish()?;
-            color_eyre::eyre::Ok(())
+            eyre::Ok(())
         });
         match sent.await {
             Ok(Ok(())) => {}
