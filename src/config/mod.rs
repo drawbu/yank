@@ -13,12 +13,17 @@
 //!   the sole writer; the CLI mutates it through the control socket.
 //! - `$XDG_STATE_HOME/yank/clip.json` and `history/`: see [`crate::clip`].
 //! - `$XDG_RUNTIME_DIR/yank.sock`: the control socket.
+//!
+//! It also owns what is not on disk but belongs to the same environment:
+//! the graphical session as the systemd user manager sees it.
 
 mod dirs;
 mod key;
 mod mesh;
 mod name;
 mod service;
+#[cfg(target_os = "linux")]
+mod session;
 mod settings;
 
 pub use dirs::{Dirs, create_private, write_private};
@@ -26,4 +31,6 @@ pub use key::MachineKey;
 pub use mesh::{MAX_MESH_PEERS, Membership, MeshState, Peer, PeerStatus};
 pub use name::{MAX_NAME_LEN, sanitize, sanitize_bounded, validate_name};
 pub use service::ServiceState;
+#[cfg(target_os = "linux")]
+pub use session::wayland_socket;
 pub use settings::Settings;

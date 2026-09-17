@@ -28,6 +28,8 @@
 //! macOS has no such event and a backend there polls `changeCount`. Either
 //! way what comes out is [`Event::Copied`].
 
+use std::path::PathBuf;
+
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::event::Selection;
@@ -104,18 +106,42 @@ impl Backend for Platform {
     }
 }
 
-/// Connects to whatever holds the clipboard on this platform.
-///
-/// Failing here is ordinary: a machine with no graphical session has no
-/// clipboard to hold, and the daemon keeps replicating without one.
-pub fn connect(events: &UnboundedSender<Event>, policy: Policy) -> eyre::Result<Platform> {
+/// Where the session's clipboard holder listens, when the platform can
+/// tell. `None` leaves it to [`connect`] to look on its own.
+pub async fn locate() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        Platform::connect(events, policy)
+        match crate::config::wayland_socket().await {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::debug!("cannot ask the session for its compositor: {err:#}");
+                None
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (events, policy);
+        None
+    }
+}
+
+/// Connects to whatever holds the clipboard on this platform, at `socket`
+/// when [`locate`] found one.
+///
+/// Failing here is ordinary: a machine with no graphical session has no
+/// clipboard to hold, and the daemon keeps replicating without one.
+pub fn connect(
+    events: &UnboundedSender<Event>,
+    policy: Policy,
+    socket: Option<PathBuf>,
+) -> eyre::Result<Platform> {
+    #[cfg(target_os = "linux")]
+    {
+        Platform::connect(events, policy, socket)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (events, policy, socket);
         eyre::bail!("yank has no clipboard backend for this platform yet")
     }
 }

@@ -531,10 +531,12 @@ impl ClipService {
             max_bytes: self.settings.max_entry_bytes(),
             ignore: self.settings.ignore_mime.clone(),
         };
-        let backend = tokio::task::spawn_blocking(move || backend::connect(&events, policy))
-            .await
-            .wrap_err("the clipboard connection task failed")?
-            .wrap_err("cannot read the clipboard")?;
+        let socket = backend::locate().await;
+        let backend =
+            tokio::task::spawn_blocking(move || backend::connect(&events, policy, socket))
+                .await
+                .wrap_err("the clipboard connection task failed")?
+                .wrap_err("cannot read the clipboard")?;
 
         *self.backend.lock().unwrap() = Some(backend);
         *self.down.lock().unwrap() = None;
