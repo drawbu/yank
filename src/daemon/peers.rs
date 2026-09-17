@@ -29,13 +29,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use iroh::{
     Endpoint, EndpointId, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{debug, info};
 
 use super::{backoff::Backoff, control, hub::Hub, topics::Topics};
 use crate::{
@@ -142,7 +141,7 @@ impl PeerSet {
             .collect();
         for id in removed {
             let handle = peers.remove(&id).expect("the id came from this map");
-            info!(peer = %handle.name, "removing machine");
+            tracing::info!(peer = %handle.name, "removing machine");
             handle.shutdown();
 
             // An aborted task stops at its next await point, which may be
@@ -161,14 +160,14 @@ impl PeerSet {
             if handle.name != name {
                 // A rename must not cost the live connection; the task
                 // keeps logging under the name it started with.
-                info!(old = %handle.name, new = %name, "renaming machine");
+                tracing::info!(old = %handle.name, new = %name, "renaming machine");
                 name.clone_into(&mut handle.name);
             }
         }
 
         for (id, name) in desired {
             peers.entry(id).or_insert_with(|| {
-                info!(peer = %name, "watching machine");
+                tracing::info!(peer = %name, "watching machine");
                 self.spawn(id, name.to_owned())
             });
         }
@@ -183,13 +182,13 @@ impl PeerSet {
         let Some(handle) = peers.get(&id) else {
             // Kept quiet on purpose: anyone who learns our endpoint id can
             // reach this, and logging louder would let them fill the logs.
-            debug!("refusing a connection from unpaired machine {id}");
+            tracing::debug!("refusing a connection from unpaired machine {id}");
             conn.close(0u32.into(), b"unauthorized");
             return;
         };
 
         if let Err(err) = handle.inbound.try_send(conn) {
-            debug!(peer = %handle.name, "dropping a surplus connection");
+            tracing::debug!(peer = %handle.name, "dropping a surplus connection");
             err.into_inner().close(0u32.into(), b"busy");
         }
     }
@@ -342,9 +341,9 @@ async fn run_peer(mut task: PeerTask) {
         };
 
         let held = Instant::now();
-        info!(peer = %task.name, outbound, "connected");
+        tracing::info!(peer = %task.name, outbound, "connected");
         task.serve(conn, outbound).await;
-        info!(peer = %task.name, "disconnected");
+        tracing::info!(peer = %task.name, "disconnected");
 
         if held.elapsed() >= STABLE_UPTIME {
             backoff.reset();
@@ -404,7 +403,7 @@ impl PeerTask {
 
             tokio::select! {
                 reason = conn.closed() => {
-                    debug!(peer = %self.name, "connection closed: {reason}");
+                    tracing::debug!(peer = %self.name, "connection closed: {reason}");
                     break;
                 }
                 Some(new) = self.inbound.recv() => {
@@ -435,14 +434,14 @@ impl PeerTask {
                 }
                 stream = conn.accept_uni() => {
                     let Ok(stream) = stream else {
-                        debug!(peer = %self.name, "connection lost");
+                        tracing::debug!(peer = %self.name, "connection lost");
                         break;
                     };
                     self.serve_uni(stream, &uni_permits, &summaries);
                 }
                 stream = conn.accept_bi() => {
                     let Ok((send, recv)) = stream else {
-                        debug!(peer = %self.name, "connection lost");
+                        tracing::debug!(peer = %self.name, "connection lost");
                         break;
                     };
                     self.serve_ask(send, recv, &ask_permits);
@@ -462,7 +461,7 @@ impl PeerTask {
         summaries: &mpsc::Sender<Summary>,
     ) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping a message: too many open streams");
+            tracing::debug!(peer = %self.name, "dropping a message: too many open streams");
             return;
         };
 
@@ -478,11 +477,11 @@ impl PeerTask {
             );
             let message = match read.await {
                 Ok(Ok(message)) => message,
-                Ok(Err(err)) => return debug!(peer = %name, "bad message: {err:#}"),
-                Err(_) => return debug!(peer = %name, "message timed out"),
+                Ok(Err(err)) => return tracing::debug!(peer = %name, "bad message: {err:#}"),
+                Err(_) => return tracing::debug!(peer = %name, "message timed out"),
             };
             if let Err(err) = message.validate() {
-                return debug!(peer = %name, "bad message: {err:#}");
+                return tracing::debug!(peer = %name, "bad message: {err:#}");
             }
 
             // A full queue means a flood in either direction; dropping is
@@ -490,12 +489,12 @@ impl PeerTask {
             match message {
                 UniMessage::Membership(membership) => {
                     if gossip.try_send((peer, membership)).is_err() {
-                        debug!(peer = %name, "dropping a membership: the queue is full");
+                        tracing::debug!(peer = %name, "dropping a membership: the queue is full");
                     }
                 }
                 UniMessage::Summary(summary) => {
                     if summaries.try_send(summary).is_err() {
-                        debug!(peer = %name, "dropping an announcement: the queue is full");
+                        tracing::debug!(peer = %name, "dropping an announcement: the queue is full");
                     }
                 }
             }
@@ -505,7 +504,7 @@ impl PeerTask {
     /// Answers whatever a peer opened a stream to ask for.
     fn serve_ask(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping a request: too many open streams");
+            tracing::debug!(peer = %self.name, "dropping a request: too many open streams");
             return;
         };
 
@@ -520,8 +519,8 @@ impl PeerTask {
             );
             let ask = match read.await {
                 Ok(Ok(ask)) => ask,
-                Ok(Err(err)) => return debug!(peer = %name, "bad request: {err:#}"),
-                Err(_) => return debug!(peer = %name, "request timed out"),
+                Ok(Err(err)) => return tracing::debug!(peer = %name, "bad request: {err:#}"),
+                Err(_) => return tracing::debug!(peer = %name, "request timed out"),
             };
 
             let served = match ask {
@@ -529,7 +528,7 @@ impl PeerTask {
                 Ask::Content(request) => send_content(send, &store, &request).await,
             };
             if let Err(err) = served {
-                debug!(peer = %name, "cannot serve a request: {err:#}");
+                tracing::debug!(peer = %name, "cannot serve a request: {err:#}");
             }
         });
     }
@@ -545,7 +544,11 @@ impl PeerTask {
 /// frame, and the receiver knows what it asked for, so it knows when it
 /// has it all. What it may not know is whether the bytes are the ones it
 /// asked for, which is why they are named by their hash.
-async fn send_content(mut send: SendStream, store: &Store, request: &ContentRequest) -> Result<()> {
+async fn send_content(
+    mut send: SendStream,
+    store: &Store,
+    request: &ContentRequest,
+) -> eyre::Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     let blob = store.blob(request.hash);
@@ -580,7 +583,11 @@ async fn send_content(mut send: SendStream, store: &Store, request: &ContentRequ
 }
 
 /// Streams the entries a peer asked for, then says so.
-async fn send_entries(mut send: SendStream, topics: &Topics, request: &FetchRequest) -> Result<()> {
+async fn send_entries(
+    mut send: SendStream,
+    topics: &Topics,
+    request: &FetchRequest,
+) -> eyre::Result<()> {
     for entry in topics.since(request.topic, &request.since) {
         let frame = FetchFrame::Entry(entry);
         write_message(&mut send, &frame, proto::MAX_FRAME_SIZE).await?;
@@ -619,11 +626,11 @@ async fn run_fetcher(
             let entries = match pulled.await {
                 Ok(Ok(entries)) => entries,
                 Ok(Err(err)) => {
-                    debug!(peer = %name, "cannot fetch: {err:#}");
+                    tracing::debug!(peer = %name, "cannot fetch: {err:#}");
                     break;
                 }
                 Err(_) => {
-                    debug!(peer = %name, "fetch timed out");
+                    tracing::debug!(peer = %name, "fetch timed out");
                     break;
                 }
             };
@@ -633,9 +640,9 @@ async fn run_fetcher(
                 break;
             }
 
-            debug!(peer = %name, "fetched {} entries", entries.len());
+            tracing::debug!(peer = %name, "fetched {} entries", entries.len());
             if let Err(err) = topics.accept(summary.topic, entries) {
-                debug!(peer = %name, "cannot apply what was fetched: {err:#}");
+                tracing::debug!(peer = %name, "cannot apply what was fetched: {err:#}");
                 break;
             }
         }
@@ -647,7 +654,7 @@ async fn fetch(
     conn: &Connection,
     topic: proto::Topic,
     since: crate::log::Watermark,
-) -> Result<Vec<WireEntry>> {
+) -> eyre::Result<Vec<WireEntry>> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let request = Ask::Entries(FetchRequest { topic, since });
     write_message(&mut send, &request, proto::MAX_REQUEST_SIZE).await?;
@@ -660,7 +667,7 @@ async fn fetch(
             .wrap_err("cannot read the answer")?;
         match frame {
             FetchFrame::Entry(entry) => {
-                ensure!(
+                eyre::ensure!(
                     entries.len() < proto::MAX_FETCH_ENTRIES,
                     "the peer sent more entries than a log can hold",
                 );
@@ -676,7 +683,7 @@ async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Option<Conne
     match endpoint.connect(peer, proto::ALPN).await {
         Ok(conn) => Some(conn),
         Err(err) => {
-            debug!(peer = %name, "cannot connect: {err:#}");
+            tracing::debug!(peer = %name, "cannot connect: {err:#}");
             None
         }
     }

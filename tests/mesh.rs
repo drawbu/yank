@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre;
 use tempfile::TempDir;
 use yank::{
     config::Dirs,
@@ -38,7 +38,7 @@ struct Machine {
 }
 
 impl Machine {
-    async fn start(lookup: &iroh::address_lookup::MemoryLookup) -> Result<Self> {
+    async fn start(lookup: &iroh::address_lookup::MemoryLookup) -> eyre::Result<Self> {
         let home = tempfile::tempdir()?;
         let dirs = Dirs::new(Some(home.path().to_owned()))?;
         write_settings(home.path())?;
@@ -62,27 +62,27 @@ impl Machine {
         }
     }
 
-    async fn restart(&mut self) -> Result<()> {
+    async fn restart(&mut self) -> eyre::Result<()> {
         self.stop().await;
         self.daemon = Some(Daemon::start(&self.dirs, &self.options).await?);
 
         Ok(())
     }
 
-    async fn ask(&self, request: &Request) -> Result<Response> {
+    async fn ask(&self, request: &Request) -> eyre::Result<Response> {
         self.ask_within(request, CLIENT_TIMEOUT).await
     }
 
     /// The same, for a request the daemon answers only once something has
     /// happened.
-    async fn ask_within(&self, request: &Request, within: Duration) -> Result<Response> {
+    async fn ask_within(&self, request: &Request, within: Duration) -> eyre::Result<Response> {
         Client::connect_required(&self.dirs)
             .await?
             .request(request, within)
             .await
     }
 
-    async fn copy(&self, text: &str) -> Result<()> {
+    async fn copy(&self, text: &str) -> eyre::Result<()> {
         self.ask(&Request::Copy {
             mime: "text/plain".to_owned(),
             bytes: text.as_bytes().to_vec(),
@@ -94,14 +94,14 @@ impl Machine {
         Ok(())
     }
 
-    async fn history(&self) -> Result<Vec<HistoryEntry>> {
+    async fn history(&self) -> eyre::Result<Vec<HistoryEntry>> {
         match self.ask(&Request::History { limit: None }).await? {
             Response::History(entries) => Ok(entries),
-            other => bail!("unexpected answer: {other:?}"),
+            other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }
 
-    async fn copy_files(&self, paths: &[PathBuf]) -> Result<String> {
+    async fn copy_files(&self, paths: &[PathBuf]) -> eyre::Result<String> {
         let paths = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
@@ -115,13 +115,13 @@ impl Machine {
             .await?
         {
             Response::Wrote { label } => Ok(label),
-            other => bail!("unexpected answer: {other:?}"),
+            other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }
 
     /// Where the files of an entry are on this machine. Asking is what
     /// makes the daemon go and get them, and the answer is what waits.
-    async fn files(&self, entry: Option<&str>) -> Result<(Option<PathBuf>, Vec<FileInfo>)> {
+    async fn files(&self, entry: Option<&str>) -> eyre::Result<(Option<PathBuf>, Vec<FileInfo>)> {
         match self
             .ask_within(
                 &Request::Files {
@@ -132,11 +132,11 @@ impl Machine {
             .await?
         {
             Response::Files { tree, files, .. } => Ok((tree.map(PathBuf::from), files)),
-            other => bail!("unexpected answer: {other:?}"),
+            other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }
 
-    async fn selection(&self) -> Result<Option<String>> {
+    async fn selection(&self) -> eyre::Result<Option<String>> {
         Ok(self
             .history()
             .await?
@@ -148,7 +148,7 @@ impl Machine {
 
 /// Writes a `config.toml` that keeps the tests off the machine running
 /// them: no compositor, and a small history so the caps are exercised.
-fn write_settings(home: &Path) -> Result<()> {
+fn write_settings(home: &Path) -> eyre::Result<()> {
     std::fs::write(
         home.join("config.toml"),
         "clipboard = false\nhistory-limit = 10\n",
@@ -158,7 +158,7 @@ fn write_settings(home: &Path) -> Result<()> {
 }
 
 /// Pairs two machines through their control sockets, ticket and all.
-async fn pair(host: &Machine, joiner: &Machine) -> Result<()> {
+async fn pair(host: &Machine, joiner: &Machine) -> eyre::Result<()> {
     let ticket = match host
         .ask(&Request::PairHost {
             name: "host".to_owned(),
@@ -166,7 +166,7 @@ async fn pair(host: &Machine, joiner: &Machine) -> Result<()> {
         .await?
     {
         Response::PairTicket(ticket) => ticket,
-        other => bail!("unexpected answer: {other:?}"),
+        other => eyre::bail!("unexpected answer: {other:?}"),
     };
 
     match joiner
@@ -177,7 +177,7 @@ async fn pair(host: &Machine, joiner: &Machine) -> Result<()> {
         .await?
     {
         Response::Paired { .. } => Ok(()),
-        other => bail!("unexpected answer: {other:?}"),
+        other => eyre::bail!("unexpected answer: {other:?}"),
     }
 }
 
@@ -186,7 +186,7 @@ async fn pair(host: &Machine, joiner: &Machine) -> Result<()> {
 async fn eventually<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<bool>>,
+    Fut: std::future::Future<Output = eyre::Result<bool>>,
 {
     let deadline = std::time::Instant::now() + SETTLE;
     loop {
@@ -201,7 +201,7 @@ where
     }
 }
 
-async fn mesh() -> Result<(Machine, Machine)> {
+async fn mesh() -> eyre::Result<(Machine, Machine)> {
     let lookup = iroh::address_lookup::MemoryLookup::default();
     let first = Machine::start(&lookup).await?;
     let second = Machine::start(&lookup).await?;
@@ -211,7 +211,7 @@ async fn mesh() -> Result<(Machine, Machine)> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn what_one_machine_copies_the_other_can_paste() -> Result<()> {
+async fn what_one_machine_copies_the_other_can_paste() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     first.copy("from the first").await?;
@@ -231,7 +231,7 @@ async fn what_one_machine_copies_the_other_can_paste() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_machine_that_was_away_catches_up_in_order() -> Result<()> {
+async fn a_machine_that_was_away_catches_up_in_order() -> eyre::Result<()> {
     let (first, mut second) = mesh().await?;
     second.stop().await;
 
@@ -260,7 +260,7 @@ async fn a_machine_that_was_away_catches_up_in_order() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_copy_survives_catching_up() -> Result<()> {
+async fn a_local_copy_survives_catching_up() -> eyre::Result<()> {
     let (first, mut second) = mesh().await?;
     second.stop().await;
 
@@ -285,7 +285,7 @@ async fn a_local_copy_survives_catching_up() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn removing_an_entry_removes_it_on_both() -> Result<()> {
+async fn removing_an_entry_removes_it_on_both() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     first.copy("a mistake").await?;
@@ -307,7 +307,7 @@ async fn removing_an_entry_removes_it_on_both() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn clearing_reaches_a_machine_that_was_away() -> Result<()> {
+async fn clearing_reaches_a_machine_that_was_away() -> eyre::Result<()> {
     let (first, mut second) = mesh().await?;
 
     first.copy("something").await?;
@@ -331,7 +331,7 @@ async fn clearing_reaches_a_machine_that_was_away() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> Result<()> {
+async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     first
@@ -363,7 +363,7 @@ async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> Result<()> {
         })
         .await?
     else {
-        bail!("expected the contents");
+        eyre::bail!("expected the contents");
     };
     assert_eq!(bytes, b"hunter2");
 
@@ -383,7 +383,7 @@ async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> Result<()> {
 /// waiting for someone to copy something. Nothing else would make a peer
 /// ask for a history written before either of them was last started.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_restarted_machine_announces_what_it_already_had() -> Result<()> {
+async fn a_restarted_machine_announces_what_it_already_had() -> eyre::Result<()> {
     let (mut first, mut second) = mesh().await?;
     second.stop().await;
 
@@ -404,7 +404,7 @@ async fn a_restarted_machine_announces_what_it_already_had() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_restarted_machine_keeps_its_history() -> Result<()> {
+async fn a_restarted_machine_keeps_its_history() -> eyre::Result<()> {
     let lookup = iroh::address_lookup::MemoryLookup::default();
     let mut machine = Machine::start(&lookup).await?;
 
@@ -422,7 +422,7 @@ async fn a_restarted_machine_keeps_its_history() -> Result<()> {
 /// machine gets is the bytes, under the names they had, and not a path
 /// into a filesystem it does not have.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> Result<()> {
+async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;
@@ -470,7 +470,7 @@ async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> Result<()> {
 /// The source is not read again at paste time, so what arrives is what was
 /// copied, whatever happened to the original in between.
 #[tokio::test(flavor = "multi_thread")]
-async fn what_arrives_is_what_was_copied_and_not_what_the_file_became() -> Result<()> {
+async fn what_arrives_is_what_was_copied_and_not_what_the_file_became() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;
@@ -497,7 +497,7 @@ async fn what_arrives_is_what_was_copied_and_not_what_the_file_became() -> Resul
 /// An entry that leaves the history takes its files with it: they are
 /// clipboard contents, and they sit on the disk in the clear.
 #[tokio::test(flavor = "multi_thread")]
-async fn dropping_an_entry_drops_its_files() -> Result<()> {
+async fn dropping_an_entry_drops_its_files() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;

@@ -12,10 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre;
 use iroh::{Endpoint, endpoint::Connection};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
 
 use super::{control::PAIR_TICKET_TTL, store::MeshStore};
 use crate::net::pair;
@@ -64,17 +63,17 @@ impl Pairing {
     }
 
     /// Issues a fresh ticket, revoking any outstanding one.
-    pub async fn host(&self, local_name: String) -> Result<pair::PairTicket> {
+    pub async fn host(&self, local_name: String) -> eyre::Result<pair::PairTicket> {
         // Revoked before the wait below: someone re-hosting to kill a
         // leaked ticket must not need the network for the old one to die.
         if self.issued.lock().unwrap().take().is_some() {
-            info!("pairing ticket revoked");
+            tracing::info!("pairing ticket revoked");
         }
 
         if self.uses_relays {
             tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online())
                 .await
-                .map_err(|_| eyre!("cannot reach an iroh relay; check the network"))?;
+                .map_err(|_| eyre::eyre!("cannot reach an iroh relay; check the network"))?;
         }
 
         let ticket = pair::PairTicket::generate(self.endpoint.addr());
@@ -83,7 +82,7 @@ impl Pairing {
             expires: Instant::now() + PAIR_TICKET_TTL,
             local_name,
         });
-        info!("pairing ticket issued");
+        tracing::info!("pairing ticket issued");
 
         Ok(ticket)
     }
@@ -95,13 +94,13 @@ impl Pairing {
     /// again; only a completed one redeems it.
     pub async fn serve_inbound(&self, conn: Connection) {
         let Ok(_permit) = self.exchanges.try_acquire() else {
-            debug!("dropping a surplus pairing connection");
+            tracing::debug!("dropping a surplus pairing connection");
             conn.close(0u32.into(), b"busy");
             return;
         };
 
         let Some((ticket, local_name)) = self.outstanding() else {
-            debug!("refusing a pairing connection: no ticket outstanding");
+            tracing::debug!("refusing a pairing connection: no ticket outstanding");
             pair::reject_attempt(&conn, "no pairing in progress on this machine").await;
             return;
         };
@@ -111,7 +110,7 @@ impl Pairing {
         let peer = match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(pair::Outcome::Paired(peer))) => peer,
             Ok(Ok(pair::Outcome::Dismissed)) => return,
-            Ok(Err(err)) => return warn!("pairing attempt failed: {err:#}"),
+            Ok(Err(err)) => return tracing::warn!("pairing attempt failed: {err:#}"),
             Err(_timeout) => {
                 conn.close(0u32.into(), b"timeout");
                 return;
@@ -127,7 +126,7 @@ impl Pairing {
                 .as_ref()
                 .is_some_and(|held| held.ticket.matches(&ticket) && Instant::now() < held.expires);
             if !live {
-                warn!("pairing discarded: the ticket is no longer valid");
+                tracing::warn!("pairing discarded: the ticket is no longer valid");
                 conn.close(0u32.into(), b"cancelled");
                 return;
             }
@@ -139,11 +138,11 @@ impl Pairing {
         match saved {
             Ok(()) => {
                 pair::confirm_paired(&conn);
-                info!(peer = %peer.name, "paired");
+                tracing::info!(peer = %peer.name, "paired");
             }
             Err(err) => {
                 conn.close(0u32.into(), b"failed");
-                warn!("pairing failed: cannot save the machine: {err:#}");
+                tracing::warn!("pairing failed: cannot save the machine: {err:#}");
             }
         }
     }
@@ -157,7 +156,7 @@ impl Pairing {
             .is_some_and(|held| held.expires <= Instant::now())
         {
             *issued = None;
-            info!("pairing ticket expired");
+            tracing::info!("pairing ticket expired");
         }
 
         issued

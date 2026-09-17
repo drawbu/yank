@@ -33,6 +33,7 @@ use crate::{
     files::Hash,
     log::{MAX_ENTRY_BYTES, Watermark, WireEntry},
 };
+use color_eyre::eyre;
 
 /// ALPN of the replication protocol. Bumped whenever the wire format
 /// changes, so mismatched daemons refuse each other instead of
@@ -149,18 +150,16 @@ impl UniMessage {
     /// Refuses a message that is structurally too big to be legitimate.
     /// What is stored is capped later regardless; this keeps the flood off
     /// the queue in the first place.
-    pub fn validate(&self) -> color_eyre::eyre::Result<()> {
-        use color_eyre::eyre::ensure;
-
+    pub fn validate(&self) -> eyre::Result<()> {
         match self {
             UniMessage::Membership(membership) => {
-                ensure!(
+                eyre::ensure!(
                     membership.peers.len() <= MAX_MESH_PEERS,
                     "membership too large"
                 );
             }
             UniMessage::Summary(summary) => {
-                ensure!(
+                eyre::ensure!(
                     summary.have.origins() <= MAX_MESH_PEERS,
                     "summary too large"
                 );

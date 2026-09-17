@@ -11,7 +11,7 @@
 use std::{fs, io::ErrorKind, time::Duration};
 
 use bytesize::ByteSize;
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{self, WrapErr as _};
 use serde::Deserialize;
 
 use super::Dirs;
@@ -133,7 +133,7 @@ impl Default for Settings {
 impl Settings {
     /// Loads `config.toml`, treating a missing file as empty. Errors on
     /// unreadable or invalid contents; the caller decides the fallback.
-    pub fn load(dirs: &Dirs) -> Result<Self> {
+    pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.settings_file();
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -148,7 +148,7 @@ impl Settings {
 
     /// Writes the commented template unless the file already exists (a
     /// concurrent writer included: the creation is exclusive).
-    pub fn write_template(dirs: &Dirs) -> Result<()> {
+    pub fn write_template(dirs: &Dirs) -> eyre::Result<()> {
         use std::io::Write as _;
 
         let path = dirs.settings_file();
@@ -191,7 +191,7 @@ impl Settings {
 
 /// Reads a duration written the way a person writes one: `90s`, `5m`,
 /// `1h 30m`.
-fn duration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+fn duration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> eyre::Result<Duration, D::Error> {
     use serde::de::Error as _;
 
     let text = String::deserialize(deserializer)?;

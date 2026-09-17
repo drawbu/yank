@@ -31,10 +31,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use color_eyre::eyre::{self, WrapErr as _};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{debug, warn};
 use wayland_client::{
     Connection, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
@@ -75,7 +74,10 @@ impl Wayland {
     /// Connects to the compositor and starts serving. [`Policy`] caps what
     /// a single capture may read, so an application offering a gigabyte
     /// cannot be used to exhaust our memory.
-    pub fn connect(events: &tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> Result<Self> {
+    pub fn connect(
+        events: &tokio_mpsc::UnboundedSender<Event>,
+        policy: Policy,
+    ) -> eyre::Result<Self> {
         let (wake_rx, wake) = rustix::pipe::pipe().wrap_err("cannot create the wake pipe")?;
         let (commands, queue) = mpsc::channel();
         let (ready, started) = mpsc::channel();
@@ -105,7 +107,7 @@ impl Wayland {
                 thread: Some(thread),
             }),
             Ok(Err(err)) => Err(err),
-            Err(_) => Err(eyre!("the Wayland thread stopped before it started")),
+            Err(_) => Err(eyre::eyre!("the Wayland thread stopped before it started")),
         }
     }
 }
@@ -117,7 +119,7 @@ impl backend::Backend for Wayland {
             return;
         };
         if commands.send(command).is_err() {
-            debug!("the Wayland backend is gone; dropping the command");
+            tracing::debug!("the Wayland backend is gone; dropping the command");
             return;
         }
 
@@ -200,7 +202,7 @@ impl wayland_client::Dispatch<WlRegistry, GlobalListContents> for State {
 impl Session {
     /// Connects, binds the globals and picks up the selection already on
     /// the clipboard.
-    fn connect(events: tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> Result<Self> {
+    fn connect(events: tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> eyre::Result<Self> {
         let connection = Connection::connect_to_env()
             .wrap_err("cannot connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
         let (globals, queue) = registry_queue_init::<State>(&connection)
@@ -214,16 +216,16 @@ impl Session {
             .map(Manager::Ext)
             .or_else(|_| globals.bind(&qh, 1..=1, ()).map(Manager::Wlr))
             .map_err(|_| {
-                eyre!(
+                eyre::eyre!(
                     "the compositor supports neither ext-data-control-v1 nor \
                      wlr-data-control-unstable-v1, so yank cannot read the clipboard"
                 )
             })?;
         let seat: WlSeat = globals
             .bind(&qh, 1..=9, ())
-            .map_err(|err| eyre!("the compositor has no seat: {err}"))?;
+            .map_err(|err| eyre::eyre!("the compositor has no seat: {err}"))?;
         let device = manager.device(&seat, &qh);
-        debug!("clipboard backend using {}", manager.protocol());
+        tracing::debug!("clipboard backend using {}", manager.protocol());
 
         let mut session = Session {
             state: State {
@@ -254,7 +256,7 @@ impl Session {
 
     /// Serves the clipboard until the command channel closes or the
     /// compositor withdraws the protocol.
-    fn run(&mut self, wake: &OwnedFd, commands: &mpsc::Receiver<Command>) -> Result<()> {
+    fn run(&mut self, wake: &OwnedFd, commands: &mpsc::Receiver<Command>) -> eyre::Result<()> {
         while self.state.alive {
             self.queue.flush()?;
             self.queue.dispatch_pending(&mut self.state)?;
@@ -291,12 +293,14 @@ impl Session {
             }
         }
 
-        Err(eyre!("the compositor withdrew the clipboard protocol"))
+        Err(eyre::eyre!(
+            "the compositor withdrew the clipboard protocol"
+        ))
     }
 
     /// Applies whatever the daemon queued. Errors only when the channel is
     /// gone for good.
-    fn run_commands(&mut self, commands: &mpsc::Receiver<Command>) -> Result<(), ()> {
+    fn run_commands(&mut self, commands: &mpsc::Receiver<Command>) -> eyre::Result<(), ()> {
         loop {
             match commands.try_recv() {
                 Ok(Command::Offer(serves)) => {
@@ -323,7 +327,7 @@ impl Session {
         for mime in pending.mimes {
             let (read, write) = match rustix::pipe::pipe() {
                 Ok(pipe) => pipe,
-                Err(err) => return warn!("cannot create a clipboard pipe: {err}"),
+                Err(err) => return tracing::warn!("cannot create a clipboard pipe: {err}"),
             };
             pending.offer.receive(mime.clone(), write.as_fd());
             // The compositor hands the write end to the source
@@ -333,7 +337,7 @@ impl Session {
             pipes.push((mime, read));
         }
         if let Err(err) = self.connection.flush() {
-            return warn!("cannot ask for the clipboard contents: {err}");
+            return tracing::warn!("cannot ask for the clipboard contents: {err}");
         }
 
         let events = self.state.events.clone();
@@ -349,7 +353,7 @@ impl Session {
                 }
             });
         if let Err(err) = spawned {
-            warn!("cannot read the clipboard: {err}");
+            tracing::warn!("cannot read the clipboard: {err}");
         }
     }
 }
@@ -375,7 +379,7 @@ impl State {
                 let secret = mimes.iter().any(|mime| mime == mime::SECRET_HINT);
                 let wanted = mime::select(&mimes, &self.policy.ignore);
                 if wanted.is_empty() {
-                    debug!("ignoring a selection with no usable type: {mimes:?}");
+                    tracing::debug!("ignoring a selection with no usable type: {mimes:?}");
                     return;
                 }
 
@@ -428,11 +432,11 @@ impl State {
                     .name("yank-clipboard-write".to_owned())
                     .spawn(move || {
                         if let Err(err) = write_all(fd, &bytes) {
-                            debug!("cannot serve the clipboard as {mime}: {err:#}");
+                            tracing::debug!("cannot serve the clipboard as {mime}: {err:#}");
                         }
                     });
                 if let Err(err) = spawned {
-                    warn!("cannot serve the clipboard: {err}");
+                    tracing::warn!("cannot serve the clipboard: {err}");
                 }
             }
             // Another application took the selection. What replaced it
@@ -529,7 +533,7 @@ fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
         }
 
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-            debug!("giving up on {} unfinished clipboard transfers", open.len());
+            tracing::debug!("giving up on {} unfinished clipboard transfers", open.len());
             break;
         };
         let mut fds: Vec<PollFd> = open
@@ -544,7 +548,7 @@ fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
             Err(err) => {
-                debug!("cannot wait on the clipboard transfers: {err}");
+                tracing::debug!("cannot wait on the clipboard transfers: {err}");
                 break;
             }
         }
@@ -568,7 +572,7 @@ fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
                 }
                 Err(rustix::io::Errno::INTR) => {}
                 Err(err) => {
-                    debug!("cannot read the clipboard as {}: {err}", entry.mime);
+                    tracing::debug!("cannot read the clipboard as {}: {err}", entry.mime);
                     entry.fd = None;
                     held -= entry.bytes.len();
                     entry.bytes.clear();
@@ -601,7 +605,7 @@ fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
 
 /// Hands our bytes to a pasting application, ignoring the pipe closing
 /// early: an application is free to read only what it wants.
-fn write_all(fd: OwnedFd, bytes: &[u8]) -> Result<()> {
+fn write_all(fd: OwnedFd, bytes: &[u8]) -> eyre::Result<()> {
     let mut file = std::fs::File::from(fd);
     match file.write_all(bytes) {
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),

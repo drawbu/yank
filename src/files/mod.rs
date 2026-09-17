@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, ensure};
+use color_eyre::eyre;
 use data_encoding::HEXLOWER;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 use serde::{Deserialize, Serialize};
@@ -124,7 +124,7 @@ impl FileRef {
 }
 
 /// What a selection of files weighs.
-pub fn total(files: &[FileRef]) -> Result<u64> {
+pub fn total(files: &[FileRef]) -> eyre::Result<u64> {
     files.iter().try_fold(0u64, |total, file| {
         total
             .checked_add(file.size)
@@ -133,12 +133,12 @@ pub fn total(files: &[FileRef]) -> Result<u64> {
 }
 
 /// Checks the manifest before it drives disk or network work.
-pub fn validate(files: &[FileRef]) -> Result<()> {
-    ensure!(
+pub fn validate(files: &[FileRef]) -> eyre::Result<()> {
+    eyre::ensure!(
         files.iter().all(FileRef::is_safe),
         "a file path is not safe"
     );
-    ensure!(
+    eyre::ensure!(
         files
             .iter()
             .all(|file| file.path.split('/').all(|part| !part.is_empty())),
@@ -146,7 +146,7 @@ pub fn validate(files: &[FileRef]) -> Result<()> {
     );
     let mut paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
     paths.sort_unstable();
-    ensure!(
+    eyre::ensure!(
         paths.windows(2).all(|pair| {
             pair[0] != pair[1]
                 && !pair[1]

@@ -5,7 +5,7 @@
 //! its own once the other machine redeems it.
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre;
 
 use super::{hostname, ui};
 use crate::{
@@ -56,14 +56,14 @@ enum PeerCommand {
     },
 }
 
-pub fn run(args: PeerArgs, dirs: &Dirs) -> Result<()> {
+pub fn run(args: PeerArgs, dirs: &Dirs) -> eyre::Result<()> {
     match args.command {
         PeerCommand::Add { ticket, name } => add(dirs, ticket, name.unwrap_or_else(hostname)),
         PeerCommand::Rm { peer } => rm(dirs, peer),
     }
 }
 
-fn add(dirs: &Dirs, ticket: Option<String>, name: String) -> Result<()> {
+fn add(dirs: &Dirs, ticket: Option<String>, name: String) -> eyre::Result<()> {
     match ticket {
         Some(ticket) => join(dirs, ticket, name),
         None => host(dirs, name),
@@ -72,10 +72,10 @@ fn add(dirs: &Dirs, ticket: Option<String>, name: String) -> Result<()> {
 
 /// Asks the daemon for a ticket and prints it. The pairing itself finishes
 /// in the daemon, so there is nothing to wait for here.
-fn host(dirs: &Dirs, name: String) -> Result<()> {
+fn host(dirs: &Dirs, name: String) -> eyre::Result<()> {
     let response = request(dirs, &Request::PairHost { name }, TICKET_TIMEOUT)?;
     let Response::PairTicket(ticket) = response else {
-        bail!("unexpected answer from the daemon: {response:?}");
+        eyre::bail!("unexpected answer from the daemon: {response:?}");
     };
 
     anstream::println!("Run this on the other machine:\n");
@@ -96,7 +96,7 @@ fn host(dirs: &Dirs, name: String) -> Result<()> {
 }
 
 /// Redeems a ticket printed by another machine.
-fn join(dirs: &Dirs, ticket: String, name: String) -> Result<()> {
+fn join(dirs: &Dirs, ticket: String, name: String) -> eyre::Result<()> {
     // Parsed here first, so a mangled paste fails at once instead of after
     // a round trip.
     let _: PairTicket = ticket.parse()?;
@@ -104,7 +104,7 @@ fn join(dirs: &Dirs, ticket: String, name: String) -> Result<()> {
     anstream::println!("Reaching the other machine...");
     let response = request(dirs, &Request::PairJoin { ticket, name }, JOIN_TIMEOUT)?;
     let Response::Paired { name, .. } = response else {
-        bail!("unexpected answer from the daemon: {response:?}");
+        eyre::bail!("unexpected answer from the daemon: {response:?}");
     };
 
     anstream::println!("{}", ui::good(format_args!("Paired with `{name}`")));
@@ -112,10 +112,10 @@ fn join(dirs: &Dirs, ticket: String, name: String) -> Result<()> {
     Ok(())
 }
 
-fn rm(dirs: &Dirs, peer: String) -> Result<()> {
+fn rm(dirs: &Dirs, peer: String) -> eyre::Result<()> {
     let response = request(dirs, &Request::RemovePeer { peer }, CLIENT_TIMEOUT)?;
     let Response::PeerRemoved(endpoint) = response else {
-        bail!("unexpected answer from the daemon: {response:?}");
+        eyre::bail!("unexpected answer from the daemon: {response:?}");
     };
 
     anstream::println!("{}", ui::good(format_args!("Removed {endpoint}")));

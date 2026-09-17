@@ -9,13 +9,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use color_eyre::eyre::Result;
-
 use super::{hub::Hub, peers::PeerSet};
 use crate::{
     config::{Dirs, MeshState},
     net::pair,
 };
+use color_eyre::eyre;
 
 /// The mesh state and everything a change to it has to reach.
 #[derive(Debug)]
@@ -60,7 +59,7 @@ impl MeshStore {
     /// Registers a machine that just paired. Doing it twice is harmless,
     /// which is what makes a half-finished pairing repairable by pairing
     /// again.
-    pub fn add_paired(&self, peer: &pair::PairedPeer) -> Result<()> {
+    pub fn add_paired(&self, peer: &pair::PairedPeer) -> eyre::Result<()> {
         self.update(|state| {
             if state.peer_name(&peer.endpoint).is_some() {
                 return Ok(());
@@ -77,7 +76,10 @@ impl MeshStore {
     /// the gossip from echoing back and forth forever. The lock is held
     /// across the whole thing on purpose, so concurrent changes reach the
     /// peer set in the order they were committed.
-    pub fn update<T>(&self, mutate: impl FnOnce(&mut MeshState) -> Result<T>) -> Result<T> {
+    pub fn update<T>(
+        &self,
+        mutate: impl FnOnce(&mut MeshState) -> eyre::Result<T>,
+    ) -> eyre::Result<T> {
         let mut state = self.state.lock().unwrap();
 
         let mut next = state.clone();

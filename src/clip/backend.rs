@@ -28,11 +28,11 @@
 //! macOS has no such event and a backend there polls `changeCount`. Either
 //! way what comes out is [`Event::Copied`].
 
-use color_eyre::eyre::Result;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::event::Selection;
 use crate::log::Payload;
+use color_eyre::eyre;
 
 /// What the daemon asks a backend to do.
 #[derive(Debug)]
@@ -109,7 +109,7 @@ impl Backend for Platform {
 ///
 /// Failing here is ordinary: a machine with no graphical session has no
 /// clipboard to hold, and the daemon keeps replicating without one.
-pub fn connect(events: &UnboundedSender<Event>, policy: Policy) -> Result<Platform> {
+pub fn connect(events: &UnboundedSender<Event>, policy: Policy) -> eyre::Result<Platform> {
     #[cfg(target_os = "linux")]
     {
         Platform::connect(events, policy)

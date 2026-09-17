@@ -7,7 +7,7 @@
 use std::time::{Duration, SystemTime};
 
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre;
 
 use super::{parse_duration, ui};
 use crate::{
@@ -44,7 +44,7 @@ pub struct ResumeArgs {
     apply: bool,
 }
 
-pub fn pause(args: &PauseArgs, dirs: &Dirs) -> Result<()> {
+pub fn pause(args: &PauseArgs, dirs: &Dirs) -> eyre::Result<()> {
     let until = args.r#for.map(|delay| SystemTime::now() + delay);
     let switch = Switch::Paused { until };
     let (capture, apply) = directions(args.capture, args.apply, switch);
@@ -52,7 +52,7 @@ pub fn pause(args: &PauseArgs, dirs: &Dirs) -> Result<()> {
     apply_pause(dirs, capture, apply)
 }
 
-pub fn resume(args: &ResumeArgs, dirs: &Dirs) -> Result<()> {
+pub fn resume(args: &ResumeArgs, dirs: &Dirs) -> eyre::Result<()> {
     let (capture, apply) = directions(args.capture, args.apply, Switch::On);
 
     apply_pause(dirs, capture, apply)
@@ -68,10 +68,10 @@ fn directions(capture: bool, apply: bool, switch: Switch) -> (Option<Switch>, Op
     (capture.then_some(switch), apply.then_some(switch))
 }
 
-fn apply_pause(dirs: &Dirs, capture: Option<Switch>, apply: Option<Switch>) -> Result<()> {
+fn apply_pause(dirs: &Dirs, capture: Option<Switch>, apply: Option<Switch>) -> eyre::Result<()> {
     let response = request(dirs, &Request::SetPause { capture, apply }, CLIENT_TIMEOUT)?;
     let Response::Paused(pause) = response else {
-        bail!("unexpected answer from the daemon: {response:?}");
+        eyre::bail!("unexpected answer from the daemon: {response:?}");
     };
 
     anstream::println!("{}", describe(pause));

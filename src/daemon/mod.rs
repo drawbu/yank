@@ -37,10 +37,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre;
 use iroh::{Endpoint, EndpointId};
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{debug, info, warn};
 
 use self::{
     clip::ClipService,
@@ -92,7 +91,7 @@ pub struct Daemon {
 
 impl Daemon {
     /// Starts every subsystem.
-    pub async fn start(dirs: &Dirs, options: &EndpointOptions) -> Result<Self> {
+    pub async fn start(dirs: &Dirs, options: &EndpointOptions) -> eyre::Result<Self> {
         let key = MachineKey::load(dirs)?;
         let state = MeshState::load(dirs)?;
 
@@ -103,15 +102,15 @@ impl Daemon {
         // Settings are read once. A broken file must not keep the daemon
         // down, so it falls back to the defaults and says so.
         if let Err(err) = Settings::write_template(dirs) {
-            warn!("cannot write the config.toml template: {err:#}");
+            tracing::warn!("cannot write the config.toml template: {err:#}");
         }
         let settings = Arc::new(Settings::load(dirs).unwrap_or_else(|err| {
-            warn!("cannot read config.toml, using the defaults: {err:#}");
+            tracing::warn!("cannot read config.toml, using the defaults: {err:#}");
             Settings::default()
         }));
 
         let endpoint = bind_endpoint(&key, alpns(), options).await?;
-        info!("daemon started as {}", key.endpoint_id());
+        tracing::info!("daemon started as {}", key.endpoint_id());
 
         let hub = Arc::new(Hub::new());
         let store = Arc::new(crate::files::Store::open(&dirs.files_dir())?);
@@ -188,7 +187,7 @@ impl Daemon {
     pub async fn failed(&mut self) -> color_eyre::Report {
         let outcome = self.tasks.join_next().await;
 
-        eyre!("a daemon subsystem stopped unexpectedly: {outcome:?}")
+        eyre::eyre!("a daemon subsystem stopped unexpectedly: {outcome:?}")
     }
 
     /// Stops everything, waiting for the tasks so the socket file is gone
@@ -201,12 +200,12 @@ impl Daemon {
 }
 
 /// Runs the daemon until it is asked to stop.
-pub async fn run(dirs: &Dirs) -> Result<()> {
+pub async fn run(dirs: &Dirs) -> eyre::Result<()> {
     let mut daemon = Daemon::start(dirs, &EndpointOptions::default()).await?;
 
     let outcome = tokio::select! {
         () = shutdown_signal() => {
-            info!("shutting down");
+            tracing::info!("shutting down");
             Ok(())
         }
         err = daemon.failed() => Err(err),
@@ -226,7 +225,7 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
 
     while let Some(incoming) = endpoint.accept().await {
         let Ok(permit) = handshakes.clone().try_acquire_owned() else {
-            debug!("dropping a connection: too many handshakes in flight");
+            tracing::debug!("dropping a connection: too many handshakes in flight");
             continue;
         };
         let Ok(connecting) = incoming.accept() else {
@@ -247,11 +246,11 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
                     pairing.serve_inbound(conn).await;
                 }
                 Ok(Ok(conn)) => {
-                    debug!("closing a connection with an unexpected protocol");
+                    tracing::debug!("closing a connection with an unexpected protocol");
                     conn.close(0u32.into(), b"unexpected alpn");
                 }
-                Ok(Err(err)) => debug!("an incoming connection failed: {err}"),
-                Err(_) => debug!("an incoming handshake timed out"),
+                Ok(Err(err)) => tracing::debug!("an incoming connection failed: {err}"),
+                Err(_) => tracing::debug!("an incoming handshake timed out"),
             }
         });
     }
@@ -273,7 +272,7 @@ async fn merge_loop(
             Ok(())
         });
         if let Err(err) = merged {
-            warn!("cannot apply the mesh state from {peer}: {err:#}");
+            tracing::warn!("cannot apply the mesh state from {peer}: {err:#}");
         }
     }
 }

@@ -11,10 +11,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail};
+use color_eyre::eyre::{self, WrapErr as _};
 use iroh::Endpoint;
 use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, warn};
 
 use super::protocol::{
     ClipboardStatus, FILES_WAIT, FileInfo, HistoryEntry, MAX_MESSAGE_SIZE, Request, Response,
@@ -67,7 +66,7 @@ pub struct Server {
 
 impl Server {
     /// Binds the socket, refusing to start beside another daemon.
-    pub fn bind(dirs: &Dirs) -> Result<Self> {
+    pub fn bind(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.socket_file();
 
         let lock_path = path.with_extension("lock");
@@ -75,7 +74,7 @@ impl Server {
             .wrap_err_with(|| format!("cannot create {}", lock_path.display()))?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => bail!("another yank daemon is already running"),
+            Err(TryLockError::WouldBlock) => eyre::bail!("another yank daemon is already running"),
             Err(TryLockError::Error(err)) => {
                 return Err(err).wrap_err_with(|| format!("cannot lock {}", lock_path.display()));
             }
@@ -112,7 +111,7 @@ impl Server {
                 Err(err) => {
                     // A lasting failure, file descriptors run out for
                     // instance, backs off instead of logging in a spin.
-                    warn!("cannot accept on the control socket: {err}");
+                    tracing::warn!("cannot accept on the control socket: {err}");
                     tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
@@ -134,8 +133,8 @@ async fn handle(mut stream: UnixStream, ctx: Arc<Context>) {
     );
     let request = match read.await {
         Ok(Ok(request)) => request,
-        Ok(Err(err)) => return debug!("bad control request: {err:#}"),
-        Err(_) => return debug!("a control client said nothing"),
+        Ok(Err(err)) => return tracing::debug!("bad control request: {err:#}"),
+        Err(_) => return tracing::debug!("a control client said nothing"),
     };
 
     let response = match answer(&ctx, request).await {
@@ -145,12 +144,12 @@ async fn handle(mut stream: UnixStream, ctx: Arc<Context>) {
         Err(err) => Response::Error(sanitize_bounded(&format!("{err:#}"))),
     };
     if let Err(err) = write_message(&mut stream, &response, MAX_MESSAGE_SIZE).await {
-        debug!("cannot answer a control client: {err:#}");
+        tracing::debug!("cannot answer a control client: {err:#}");
     }
 }
 
 /// Runs one request.
-async fn answer(ctx: &Context, request: Request) -> Result<Response> {
+async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
     let clip = &ctx.topics.clipboard;
 
     match request {

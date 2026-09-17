@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{self, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
 use super::mime;
@@ -187,7 +187,7 @@ impl Event {
 
     /// Decodes a log payload written by another machine, or read back from
     /// disk.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
+    pub fn decode(bytes: &[u8]) -> eyre::Result<Self> {
         postcard::from_bytes(bytes).wrap_err("cannot decode the clipboard event")
     }
 }

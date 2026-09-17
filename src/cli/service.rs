@@ -21,7 +21,7 @@ use std::{
 };
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 
 use super::ui;
 use crate::config::{Dirs, ServiceState};
@@ -83,7 +83,7 @@ enum ServiceCommand {
     Restart,
 }
 
-pub fn run(args: ServiceArgs, dirs: &Dirs) -> Result<()> {
+pub fn run(args: ServiceArgs, dirs: &Dirs) -> eyre::Result<()> {
     let state = ServiceState::load(dirs)?;
 
     match args.command {
@@ -115,9 +115,9 @@ pub fn run(args: ServiceArgs, dirs: &Dirs) -> Result<()> {
 /// unit file is a symlink (how Nix installs one into the user's
 /// directory), or the system already provides a unit under the same name,
 /// which ours would shadow rather than replace.
-fn ensure_ours(state: Option<&ServiceState>) -> Result<()> {
+fn ensure_ours(state: Option<&ServiceState>) -> eyre::Result<()> {
     if let Some(state) = state {
-        ensure!(
+        eyre::ensure!(
             state.installer == ServiceState::CLI,
             "the service is managed by {}: change that configuration instead",
             state.installer,
@@ -127,7 +127,7 @@ fn ensure_ours(state: Option<&ServiceState>) -> Result<()> {
     }
 
     let path = unit_path()?;
-    ensure!(
+    eyre::ensure!(
         !path.is_symlink(),
         "{} is a symlink, so something else manages the service: \
          refusing to replace it",
@@ -139,7 +139,7 @@ fn ensure_ours(state: Option<&ServiceState>) -> Result<()> {
         .map(|dir| Path::new(dir).join(UNIT))
         .find(|path| path.exists())
     {
-        bail!(
+        eyre::bail!(
             "{} already provides this service: installing would shadow it, \
              not replace it. Change that configuration instead.",
             system.display(),
@@ -150,12 +150,12 @@ fn ensure_ours(state: Option<&ServiceState>) -> Result<()> {
 }
 
 /// Writes the unit and starts it.
-fn install(dirs: &Dirs, program: Option<PathBuf>) -> Result<()> {
+fn install(dirs: &Dirs, program: Option<PathBuf>) -> eyre::Result<()> {
     let program = match program {
         Some(program) => program,
         None => std::env::current_exe().wrap_err("cannot find the yank binary")?,
     };
-    ensure!(
+    eyre::ensure!(
         program.is_absolute(),
         "the program path must be absolute: {program:?}",
     );
@@ -188,7 +188,7 @@ fn install(dirs: &Dirs, program: Option<PathBuf>) -> Result<()> {
 }
 
 /// Stops the service and removes the unit.
-fn uninstall(dirs: &Dirs) -> Result<()> {
+fn uninstall(dirs: &Dirs) -> eyre::Result<()> {
     // Ignored: disabling a service that is not installed fails, and the
     // point here is to end up with it gone either way.
     let _ = systemctl(&["disable", "--now", UNIT]);
@@ -214,11 +214,11 @@ fn uninstall(dirs: &Dirs) -> Result<()> {
 }
 
 /// Restarts the service and checks it is still running afterwards.
-fn restart() -> Result<()> {
+fn restart() -> eyre::Result<()> {
     systemctl(&["restart", UNIT])?;
     std::thread::sleep(SETTLE);
 
-    ensure!(
+    eyre::ensure!(
         Command::new("systemctl")
             .args(["--user", "is-active", "--quiet", UNIT])
             .status()
@@ -266,11 +266,11 @@ fn unit(command: &str) -> String {
 /// space or a percent sign would otherwise become two arguments or an
 /// entirely different path. A newline cannot be represented at all, since
 /// it would end the directive.
-fn quote(arg: &OsStr) -> Result<String> {
+fn quote(arg: &OsStr) -> eyre::Result<String> {
     let text = arg
         .to_str()
         .ok_or_else(|| color_eyre::eyre::eyre!("{arg:?} is not valid UTF-8"))?;
-    ensure!(
+    eyre::ensure!(
         !text.chars().any(char::is_control),
         "{arg:?} contains control characters, which a unit file cannot hold",
     );
@@ -294,7 +294,7 @@ fn quote(arg: &OsStr) -> Result<String> {
 
 /// Runs one `systemctl --user` command, reporting what it said when it
 /// fails.
-fn systemctl(args: &[&str]) -> Result<()> {
+fn systemctl(args: &[&str]) -> eyre::Result<()> {
     let output = Command::new("systemctl")
         .arg("--user")
         .args(args)
@@ -303,7 +303,7 @@ fn systemctl(args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
+        eyre::bail!(
             "systemctl --user {} failed: {}",
             args.join(" "),
             crate::config::sanitize_bounded(stderr.trim()),
@@ -314,7 +314,7 @@ fn systemctl(args: &[&str]) -> Result<()> {
 }
 
 /// Where the user's own units live.
-fn unit_path() -> Result<PathBuf> {
+fn unit_path() -> eyre::Result<PathBuf> {
     use etcetera::BaseStrategy as _;
 
     Ok(etcetera::choose_base_strategy()

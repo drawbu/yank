@@ -11,9 +11,9 @@ mod ui;
 use std::{path::PathBuf, time::Duration};
 
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
-use color_eyre::eyre::Result;
 
 use crate::config::Dirs;
+use color_eyre::eyre;
 
 /// A peer-to-peer clipboard daemon
 ///
@@ -64,7 +64,7 @@ enum Command {
 }
 
 /// Runs the command line.
-pub fn run() -> Result<()> {
+pub fn run() -> eyre::Result<()> {
     // Answers completion requests (`COMPLETE=<shell> yank ...`) and exits;
     // does nothing on a normal invocation. Has to come before anything is
     // parsed or printed.
@@ -102,7 +102,7 @@ pub fn report_error(err: &color_eyre::Report) {
     anstream::eprintln!("{}", ui::bad(message));
 }
 
-fn parse_duration(text: &str) -> Result<Duration, String> {
+fn parse_duration(text: &str) -> eyre::Result<Duration, String> {
     humantime::parse_duration(text).map_err(|err| err.to_string())
 }
 

@@ -23,7 +23,7 @@
 
 use std::{fmt, str::FromStr, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use color_eyre::eyre::{self, WrapErr as _};
 use data_encoding::BASE32_NOPAD;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -99,18 +99,18 @@ impl fmt::Display for PairTicket {
 impl FromStr for PairTicket {
     type Err = color_eyre::eyre::Error;
 
-    fn from_str(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> eyre::Result<Self> {
         let encoded = s
             .trim()
             .strip_prefix(TICKET_PREFIX)
-            .ok_or_else(|| eyre!("not a yank pairing ticket"))?;
+            .ok_or_else(|| eyre::eyre!("not a yank pairing ticket"))?;
         let bytes = BASE32_NOPAD
             .decode(encoded.to_ascii_uppercase().as_bytes())
             .wrap_err("invalid pairing ticket")?;
 
         let (ticket, rest) =
             postcard::take_from_bytes(&bytes).wrap_err("invalid pairing ticket")?;
-        ensure!(rest.is_empty(), "invalid pairing ticket: trailing bytes");
+        eyre::ensure!(rest.is_empty(), "invalid pairing ticket: trailing bytes");
 
         Ok(ticket)
     }
@@ -185,7 +185,7 @@ pub async fn pair_with(
     ticket: &PairTicket,
     local_name: &str,
     state: &MeshState,
-) -> Result<Outcome> {
+) -> eyre::Result<Outcome> {
     let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
         let hello = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
@@ -233,9 +233,9 @@ pub async fn pair_with(
     match read_message(&mut recv, MAX_MESSAGE_SIZE).await {
         Ok(Message::Done) => {}
         Ok(Message::Reject { reason }) => {
-            bail!("the other machine refused: {}", sanitize_bounded(&reason))
+            eyre::bail!("the other machine refused: {}", sanitize_bounded(&reason))
         }
-        Ok(msg) => bail!("unexpected message from the other machine: {msg:?}"),
+        Ok(msg) => eyre::bail!("unexpected message from the other machine: {msg:?}"),
         // The connection died mid-exchange: let the joiner retry with the
         // same ticket rather than burning it.
         Err(_) => return Ok(Outcome::Dismissed),
@@ -269,8 +269,8 @@ pub async fn join(
     ticket: &PairTicket,
     local_name: &str,
     state: &MeshState,
-) -> Result<PairedPeer> {
-    ensure!(
+) -> eyre::Result<PairedPeer> {
+    eyre::ensure!(
         ticket.addr.id != endpoint.secret_key().public(),
         "cannot pair a machine with itself",
     );
@@ -292,9 +292,9 @@ pub async fn join(
         Message::Welcome { name } => name,
         Message::Reject { reason } => {
             conn.close(0u32.into(), b"rejected");
-            bail!("pairing refused: {}", sanitize_bounded(&reason));
+            eyre::bail!("pairing refused: {}", sanitize_bounded(&reason));
         }
-        msg => bail!("unexpected message from the other machine: {msg:?}"),
+        msg => eyre::bail!("unexpected message from the other machine: {msg:?}"),
     };
 
     let name = resolve_peer_name(&conn, &mut send, announced, &host, state).await?;
@@ -308,7 +308,7 @@ pub async fn join(
         ConnectionError::ApplicationClosed(close)
             if close.error_code == VarInt::from_u32(0)
                 && close.reason.as_ref() == PAIRED_REASON => {}
-        reason => bail!(
+        reason => eyre::bail!(
             "the connection dropped before pairing completed ({reason}); \
              check `yank status` on the other machine before trying again",
         ),
@@ -331,7 +331,7 @@ async fn resolve_peer_name(
     announced: String,
     endpoint: &EndpointId,
     state: &MeshState,
-) -> Result<String> {
+) -> eyre::Result<String> {
     if let Some(existing) = state.peer_name(endpoint) {
         return Ok(existing.to_owned());
     }

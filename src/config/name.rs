@@ -5,7 +5,7 @@
 //! in length and stripped of characters that could hide or reorder what the
 //! user sees.
 
-use color_eyre::eyre::{Result, ensure};
+use color_eyre::eyre;
 
 /// Maximum length of a machine name, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
@@ -15,13 +15,13 @@ const MAX_SANITIZED_LEN: usize = 256;
 
 /// Checks that a name is usable; `kind` names it in the error. Also applied
 /// to names arriving from remote machines.
-pub fn validate_name(kind: &str, name: &str) -> Result<()> {
-    ensure!(!name.is_empty(), "{kind} name cannot be empty");
-    ensure!(
+pub fn validate_name(kind: &str, name: &str) -> eyre::Result<()> {
+    eyre::ensure!(!name.is_empty(), "{kind} name cannot be empty");
+    eyre::ensure!(
         name.len() <= MAX_NAME_LEN,
         "{kind} name is longer than {MAX_NAME_LEN} bytes",
     );
-    ensure!(
+    eyre::ensure!(
         !name.chars().any(is_confusable),
         "{kind} name contains control or invisible characters",
     );

@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use color_eyre::eyre::{self, WrapErr as _};
 use data_encoding::BASE64;
 use iroh::{EndpointId, SecretKey};
 
@@ -22,7 +22,7 @@ pub struct MachineKey(SecretKey);
 
 impl MachineKey {
     /// Loads the key, generating and persisting one on first use.
-    pub fn load(dirs: &Dirs) -> Result<Self> {
+    pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.identity_file();
 
         match fs::read_to_string(&path) {
@@ -42,19 +42,19 @@ impl MachineKey {
         &self.0
     }
 
-    fn decode(content: &str) -> Result<Self> {
+    fn decode(content: &str) -> eyre::Result<Self> {
         let key: [u8; 32] = BASE64
             .decode(content.trim_ascii().as_bytes())
             .wrap_err("cannot decode the identity key")?
             .try_into()
-            .map_err(|_| eyre!("cannot decode the identity key: expected 32 bytes"))?;
+            .map_err(|_| eyre::eyre!("cannot decode the identity key: expected 32 bytes"))?;
 
         Ok(Self(SecretKey::from_bytes(&key)))
     }
 
     /// Writes a fresh key, owner-only and refusing to overwrite: losing an
     /// identity means every peer has to pair again.
-    fn generate(path: &Path) -> Result<Self> {
+    fn generate(path: &Path) -> eyre::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
 
         let key = SecretKey::generate();

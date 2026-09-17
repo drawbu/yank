@@ -2,7 +2,7 @@
 
 use std::{fs, io::ErrorKind};
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{self, WrapErr as _};
 use serde::{Deserialize, Serialize};
 
 use super::Dirs;
@@ -24,7 +24,7 @@ impl ServiceState {
     pub const CLI: &str = "cli";
 
     /// Reads the record; `None` when there is none.
-    pub fn load(dirs: &Dirs) -> Result<Option<Self>> {
+    pub fn load(dirs: &Dirs) -> eyre::Result<Option<Self>> {
         let path = dirs.service_file();
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -40,7 +40,7 @@ impl ServiceState {
     }
 
     /// Records `label` as installed by the CLI.
-    pub fn record_cli(dirs: &Dirs, label: &str) -> Result<()> {
+    pub fn record_cli(dirs: &Dirs, label: &str) -> eyre::Result<()> {
         let state = Self {
             installer: Self::CLI.to_owned(),
             label: label.to_owned(),
@@ -55,7 +55,7 @@ impl ServiceState {
     }
 
     /// Removes the record; a missing file is fine.
-    pub fn clear(dirs: &Dirs) -> Result<()> {
+    pub fn clear(dirs: &Dirs) -> eyre::Result<()> {
         let path = dirs.service_file();
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),

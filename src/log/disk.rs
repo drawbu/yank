@@ -16,9 +16,8 @@ use std::{
     thread,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 use super::{Entry, EntryId, WireEntry};
 use crate::config::write_private;
@@ -57,7 +56,7 @@ enum Op {
 
 impl Writer {
     /// Starts the writer for `dir`, creating the directory if needed.
-    pub fn spawn(dir: PathBuf) -> Result<Self> {
+    pub fn spawn(dir: PathBuf) -> eyre::Result<Self> {
         prepare(&dir)?;
 
         let (queue, ops) = mpsc::channel();
@@ -74,7 +73,7 @@ impl Writer {
     }
 
     /// Reads back every entry in `dir`, discarding the unreadable ones.
-    pub fn load(dir: &Path) -> Result<Vec<WireEntry>> {
+    pub fn load(dir: &Path) -> eyre::Result<Vec<WireEntry>> {
         prepare(dir)?;
         let listing = match fs::read_dir(dir) {
             Ok(listing) => listing,
@@ -100,7 +99,7 @@ impl Writer {
                 // version. It is one clipboard entry: drop it and move on
                 // rather than refusing to start.
                 Err(err) => {
-                    warn!("discarding {}: {err:#}", path.display());
+                    tracing::warn!("discarding {}: {err:#}", path.display());
                     let _ = fs::remove_file(&path);
                 }
             }
@@ -131,19 +130,19 @@ impl Writer {
         if let Some(queue) = &self.queue
             && queue.send(op).is_err()
         {
-            warn!("the history writer stopped; entries are no longer persisted");
+            tracing::warn!("the history writer stopped; entries are no longer persisted");
         }
     }
 }
 
 /// Makes the history directory match this build's schema.
-fn prepare(dir: &Path) -> Result<()> {
+fn prepare(dir: &Path) -> eyre::Result<()> {
     let meta = dir.join(META);
     match fs::read(&meta) {
         Ok(bytes) => {
             let meta: Meta = serde_json::from_slice(&bytes)
                 .wrap_err_with(|| format!("cannot read {}", meta.display()))?;
-            ensure!(
+            eyre::ensure!(
                 meta.version == VERSION,
                 "history schema {} is newer than this yank",
                 meta.version,
@@ -193,7 +192,7 @@ fn run(ops: &mpsc::Receiver<Op>) {
         // The history is a convenience; losing a file is not worth taking
         // the daemon down for.
         if let Err(err) = outcome {
-            debug!("history write failed: {err:#}");
+            tracing::debug!("history write failed: {err:#}");
         }
     }
 }

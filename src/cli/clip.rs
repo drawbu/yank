@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Args;
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 
 use super::{parse_duration, ui};
 use crate::{
@@ -128,7 +128,7 @@ pub struct ClearArgs {
     history: bool,
 }
 
-pub fn copy(args: CopyArgs, dirs: &Dirs) -> Result<()> {
+pub fn copy(args: CopyArgs, dirs: &Dirs) -> eyre::Result<()> {
     if !args.files.is_empty() {
         return copy_files(&args, dirs);
     }
@@ -162,9 +162,9 @@ pub fn copy(args: CopyArgs, dirs: &Dirs) -> Result<()> {
 }
 
 /// Shares files themselves rather than the text of their paths.
-fn copy_files(args: &CopyArgs, dirs: &Dirs) -> Result<()> {
+fn copy_files(args: &CopyArgs, dirs: &Dirs) -> eyre::Result<()> {
     if !args.text.is_empty() {
-        bail!("copy either text or files, not both");
+        eyre::bail!("copy either text or files, not both");
     }
 
     let paths = args
@@ -202,7 +202,7 @@ fn copy_files(args: &CopyArgs, dirs: &Dirs) -> Result<()> {
 ///
 /// The daemon answers once they are laid out on this machine, so what
 /// takes time is the transfer itself.
-pub fn get(args: &GetArgs, dirs: &Dirs) -> Result<()> {
+pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(
         dirs,
         &Request::Files {
@@ -214,7 +214,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> Result<()> {
         return unexpected(&response);
     };
     let Some(tree) = tree else {
-        bail!("the files of {label} have not arrived; the daemon is still trying");
+        eyre::bail!("the files of {label} have not arrived; the daemon is still trying");
     };
     let tree = PathBuf::from(tree);
 
@@ -222,7 +222,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> Result<()> {
     // does not leave half an entry behind.
     for file in &files {
         let to = args.to.join(&file.path);
-        ensure!(!to.exists(), "{} is already there", to.display());
+        eyre::ensure!(!to.exists(), "{} is already there", to.display());
     }
     for file in &files {
         let (from, to) = (tree.join(&file.path), args.to.join(&file.path));
@@ -248,7 +248,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> Result<()> {
     Ok(())
 }
 
-pub fn paste(args: &PasteArgs, dirs: &Dirs) -> Result<()> {
+pub fn paste(args: &PasteArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(
         dirs,
         &Request::Paste {
@@ -286,7 +286,7 @@ pub fn paste(args: &PasteArgs, dirs: &Dirs) -> Result<()> {
     }
 }
 
-pub fn list(args: &ListArgs, dirs: &Dirs) -> Result<()> {
+pub fn list(args: &ListArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(
         dirs,
         &Request::History { limit: args.limit },
@@ -323,7 +323,7 @@ pub fn list(args: &ListArgs, dirs: &Dirs) -> Result<()> {
     Ok(())
 }
 
-pub fn pick(args: PickArgs, dirs: &Dirs) -> Result<()> {
+pub fn pick(args: PickArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(dirs, &Request::Pick { entry: args.entry }, CLIENT_TIMEOUT)?;
 
     match response {
@@ -335,7 +335,7 @@ pub fn pick(args: PickArgs, dirs: &Dirs) -> Result<()> {
     }
 }
 
-pub fn rm(args: RmArgs, dirs: &Dirs) -> Result<()> {
+pub fn rm(args: RmArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(dirs, &Request::Forget { entry: args.entry }, CLIENT_TIMEOUT)?;
 
     match response {
@@ -347,7 +347,7 @@ pub fn rm(args: RmArgs, dirs: &Dirs) -> Result<()> {
     }
 }
 
-pub fn clear(args: &ClearArgs, dirs: &Dirs) -> Result<()> {
+pub fn clear(args: &ClearArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(
         dirs,
         &Request::Clear {
@@ -400,6 +400,6 @@ fn preview(entry: &HistoryEntry) -> String {
     }
 }
 
-fn unexpected(response: &Response) -> Result<()> {
-    bail!("unexpected answer from the daemon: {response:?}")
+fn unexpected(response: &Response) -> eyre::Result<()> {
+    eyre::bail!("unexpected answer from the daemon: {response:?}")
 }

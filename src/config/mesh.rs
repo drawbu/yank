@@ -13,7 +13,7 @@
 
 use std::{cmp, collections::BTreeMap, fs, io::ErrorKind};
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
@@ -92,7 +92,7 @@ impl Peer {
 
 impl MeshState {
     /// Loads `mesh.json`, treating a missing file as an empty mesh.
-    pub fn load(dirs: &Dirs) -> Result<Self> {
+    pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.mesh_file();
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -107,7 +107,7 @@ impl MeshState {
 
     /// Writes `mesh.json` atomically: a crash mid-write must not cost the
     /// user every pairing.
-    pub fn save(&self, dirs: &Dirs) -> Result<()> {
+    pub fn save(&self, dirs: &Dirs) -> eyre::Result<()> {
         let path = dirs.mesh_file();
         let text = serde_json::to_vec_pretty(self).expect("mesh state must serialize");
         write_private(&path, &text)
@@ -133,7 +133,7 @@ impl MeshState {
     }
 
     /// Registers a machine under `name`.
-    pub fn add_peer(&mut self, id: EndpointId, name: String) -> Result<()> {
+    pub fn add_peer(&mut self, id: EndpointId, name: String) -> eyre::Result<()> {
         self.validate_new_peer(&name, &id)?;
 
         let version = self.next_version(&id)?;
@@ -150,8 +150,8 @@ impl MeshState {
 
     /// Retires a machine, leaving a tombstone so the removal propagates
     /// instead of being undone by a machine that missed it.
-    pub fn remove_peer(&mut self, id: &EndpointId) -> Result<()> {
-        ensure!(self.peer_name(id).is_some(), "unknown machine");
+    pub fn remove_peer(&mut self, id: &EndpointId) -> eyre::Result<()> {
+        eyre::ensure!(self.peer_name(id).is_some(), "unknown machine");
 
         let version = self.next_version(id)?;
         self.peers.insert(
@@ -168,9 +168,9 @@ impl MeshState {
     /// Whether a machine not yet in the mesh could be added under `name`.
     /// Checked before pairing, so a refusal reaches the other side while
     /// it is still listening.
-    pub fn validate_new_peer(&self, name: &str, id: &EndpointId) -> Result<()> {
+    pub fn validate_new_peer(&self, name: &str, id: &EndpointId) -> eyre::Result<()> {
         validate_name("machine", name)?;
-        ensure!(
+        eyre::ensure!(
             self.peers.len() < MAX_MESH_PEERS || self.peers.contains_key(id),
             "the mesh already has {MAX_MESH_PEERS} machines",
         );
@@ -180,7 +180,7 @@ impl MeshState {
 
     /// Resolves what the user typed to a machine: an exact name, or a
     /// prefix of an endpoint id when names are ambiguous or unknown.
-    pub fn resolve_peer(&self, needle: &str) -> Result<EndpointId> {
+    pub fn resolve_peer(&self, needle: &str) -> eyre::Result<EndpointId> {
         let by_name: Vec<EndpointId> = self
             .alive_peers()
             .filter(|(_, name)| *name == needle)
@@ -198,8 +198,8 @@ impl MeshState {
 
         match matched.as_slice() {
             [id] => Ok(*id),
-            [] => bail!("no machine named `{}`", super::sanitize(needle)),
-            ids => bail!(
+            [] => eyre::bail!("no machine named `{}`", super::sanitize(needle)),
+            ids => eyre::bail!(
                 "`{}` matches {} machines; use an endpoint id instead",
                 super::sanitize(needle),
                 ids.len(),
@@ -242,9 +242,9 @@ impl MeshState {
     /// The version a local change to `id` must carry to outrank the stored
     /// record. Refuses to pass the ceiling: saturating there would make the
     /// record unchangeable, so a corrupt one is reported instead.
-    fn next_version(&self, id: &EndpointId) -> Result<u64> {
+    fn next_version(&self, id: &EndpointId) -> eyre::Result<u64> {
         let version = self.peers.get(id).map_or(0, |peer| peer.version);
-        ensure!(
+        eyre::ensure!(
             version < MAX_RECORD_VERSION,
             "the record of `{id}` is corrupt (version {version}); \
              remove it from mesh.json on every machine",

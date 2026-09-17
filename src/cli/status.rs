@@ -1,7 +1,7 @@
 //! `yank status`: what the daemon is doing.
 
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre;
 
 use super::{pause, ui};
 use crate::{
@@ -16,10 +16,10 @@ use crate::{
 #[derive(Debug, Args)]
 pub struct StatusArgs {}
 
-pub fn run(_args: &StatusArgs, dirs: &Dirs) -> Result<()> {
+pub fn run(_args: &StatusArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(dirs, &Request::Status, CLIENT_TIMEOUT)?;
     let Response::Status(status) = response else {
-        bail!("unexpected answer from the daemon: {response:?}");
+        eyre::bail!("unexpected answer from the daemon: {response:?}");
     };
 
     print(&status);

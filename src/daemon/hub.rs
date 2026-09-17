@@ -30,7 +30,6 @@ use std::{
 
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::sync::Notify;
-use tracing::debug;
 
 use crate::{
     config::Membership,
@@ -192,8 +191,8 @@ async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
         });
         match sent.await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => return debug!("cannot send to a peer: {err:#}"),
-            Err(_) => return debug!("sending to a peer timed out"),
+            Ok(Err(err)) => return tracing::debug!("cannot send to a peer: {err:#}"),
+            Err(_) => return tracing::debug!("sending to a peer timed out"),
         }
     }
 }

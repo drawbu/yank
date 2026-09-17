@@ -36,7 +36,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{Result, bail, ensure};
+use color_eyre::eyre;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -225,7 +225,7 @@ impl Clipboard {
 
     /// Resolves what a user typed to one entry: a full or partial
     /// [`EntryId::label`].
-    pub fn resolve(&self, needle: &str) -> Result<&Item> {
+    pub fn resolve(&self, needle: &str) -> eyre::Result<&Item> {
         let matched: Vec<&Item> = self
             .items
             .values()
@@ -234,8 +234,8 @@ impl Clipboard {
 
         match matched.as_slice() {
             [item] => Ok(item),
-            [] => bail!("no entry matching `{}`", crate::config::sanitize(needle)),
-            items => bail!(
+            [] => eyre::bail!("no entry matching `{}`", crate::config::sanitize(needle)),
+            items => eyre::bail!(
                 "`{}` matches {} entries",
                 crate::config::sanitize(needle),
                 items.len()
@@ -244,7 +244,7 @@ impl Clipboard {
     }
 
     /// The entry a caller named, or the selection when it named none.
-    pub fn named(&self, needle: Option<&str>) -> Result<&Item> {
+    pub fn named(&self, needle: Option<&str>) -> eyre::Result<&Item> {
         match needle {
             Some(needle) => self.resolve(needle),
             None => self
@@ -254,14 +254,14 @@ impl Clipboard {
     }
 
     /// The copied bytes of an entry, decoded from the log.
-    pub fn body(&self, id: EntryId) -> Result<Copy> {
+    pub fn body(&self, id: EntryId) -> eyre::Result<Copy> {
         let entry = self
             .log
             .get(id)
             .ok_or_else(|| color_eyre::eyre::eyre!("entry {id} is gone"))?;
         match Event::decode(&entry.payload)? {
             Event::Copy(copy) => Ok(copy),
-            _ => bail!("entry {id} is not a copied selection"),
+            _ => eyre::bail!("entry {id} is not a copied selection"),
         }
     }
 
@@ -276,11 +276,11 @@ impl Clipboard {
         files: Vec<FileRef>,
         secret: bool,
         ttl: Option<Duration>,
-    ) -> Result<(EntryId, Vec<Effect>)> {
+    ) -> eyre::Result<(EntryId, Vec<Effect>)> {
         let size = selection.size();
         files::validate(&files)?;
-        ensure!(size > 0, "nothing to copy");
-        ensure!(
+        eyre::ensure!(size > 0, "nothing to copy");
+        eyre::ensure!(
             size <= self.settings.max_entry_bytes(),
             "the selection is larger than the {} limit in config.toml",
             self.settings.max_entry_size,
@@ -302,7 +302,11 @@ impl Clipboard {
     /// The bytes are already on the clipboard, so the new entry is marked
     /// as applied: putting them back would take the selection away from
     /// the application that owns it, for nothing.
-    pub fn captured(&mut self, captured: Captured, files: Vec<FileRef>) -> Result<Vec<Effect>> {
+    pub fn captured(
+        &mut self,
+        captured: Captured,
+        files: Vec<FileRef>,
+    ) -> eyre::Result<Vec<Effect>> {
         if !self.pause.capture.is_on(SystemTime::now()) {
             return Ok(Vec::new());
         }
@@ -355,7 +359,7 @@ impl Clipboard {
     /// nothing behind. A peer that sends those is broken or hostile, and
     /// dropping the batch costs nothing: its next announcement makes us
     /// ask again.
-    pub fn accept(&mut self, entries: Vec<WireEntry>) -> Result<Vec<Effect>> {
+    pub fn accept(&mut self, entries: Vec<WireEntry>) -> eyre::Result<Vec<Effect>> {
         for wire in &entries {
             self.log.validate(wire)?;
             if let Ok(Event::Copy(copy)) = Event::decode(&wire.payload) {
@@ -418,7 +422,7 @@ impl Clipboard {
     /// Makes an entry already in the history the selection again, by
     /// copying it anew: history is append-only, so promoting an entry
     /// means writing it, not moving it.
-    pub fn pick(&mut self, id: EntryId) -> Result<(EntryId, Vec<Effect>)> {
+    pub fn pick(&mut self, id: EntryId) -> eyre::Result<(EntryId, Vec<Effect>)> {
         let copy = self.body(id)?;
         let ttl = copy.ttl.map(u64::from).map(Duration::from_secs);
         let secret = copy.secret;
@@ -447,14 +451,14 @@ impl Clipboard {
     }
 
     /// Empties the clipboard on every machine.
-    pub fn clear(&mut self) -> Result<Vec<Effect>> {
+    pub fn clear(&mut self) -> eyre::Result<Vec<Effect>> {
         let (_, changes) = self.log.append(Event::Clear.encode(), true)?;
 
         Ok(self.ingest(changes))
     }
 
     /// Drops one entry from every machine.
-    pub fn forget(&mut self, id: EntryId) -> Result<Vec<Effect>> {
+    pub fn forget(&mut self, id: EntryId) -> eyre::Result<Vec<Effect>> {
         let (_, changes) = self.log.append(Event::Forget(id).encode(), true)?;
 
         Ok(self.ingest(changes))
@@ -466,7 +470,7 @@ impl Clipboard {
     /// machine happens to hold: a machine that has not caught up yet holds
     /// little or nothing, and a purge derived from that would drop nothing
     /// anywhere while reporting success.
-    pub fn purge(&mut self) -> Result<Vec<Effect>> {
+    pub fn purge(&mut self) -> eyre::Result<Vec<Effect>> {
         let (_, changes) = self.log.append(Event::Purge.encode(), true)?;
 
         Ok(self.ingest(changes))

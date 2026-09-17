@@ -25,8 +25,7 @@ use std::{
     sync::Mutex,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
-use tracing::{debug, warn};
+use color_eyre::eyre::{self, WrapErr as _};
 use walkdir::WalkDir;
 
 use super::{FileRef, Hash};
@@ -73,7 +72,7 @@ pub struct Incoming {
 
 impl Store {
     /// Opens the spool under `root`, creating what is missing.
-    pub fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path) -> eyre::Result<Self> {
         let store = Store {
             blobs: root.join("blobs"),
             trees: root.join("trees"),
@@ -112,17 +111,17 @@ impl Store {
     }
 
     /// Takes a snapshot of a file into the spool without reserving it against a sweep.
-    pub fn take(&self, source: &Path) -> Result<(Hash, u64)> {
+    pub fn take(&self, source: &Path) -> eyre::Result<(Hash, u64)> {
         self.take_inner(source, false)
     }
 
     /// Takes a file into the spool and keeps it safe from a concurrent
     /// sweep until [`Self::release`] publishes its manifest.
-    pub fn take_reserved(&self, source: &Path) -> Result<(Hash, u64)> {
+    pub fn take_reserved(&self, source: &Path) -> eyre::Result<(Hash, u64)> {
         self.take_inner(source, true)
     }
 
-    fn take_inner(&self, source: &Path, reserve: bool) -> Result<(Hash, u64)> {
+    fn take_inner(&self, source: &Path, reserve: bool) -> eyre::Result<(Hash, u64)> {
         let tmp = self
             .blobs
             .join(format!("{TAKING}{:016x}", rand::random::<u64>()));
@@ -172,7 +171,7 @@ impl Store {
     ///
     /// What is already on disk is hashed back in, so the verification at
     /// the end covers the whole file and not only what this run wrote.
-    pub fn receive(&self, hash: Hash) -> Result<Incoming> {
+    pub fn receive(&self, hash: Hash) -> eyre::Result<Incoming> {
         let path = self.blobs.join(format!("{}{PARTIAL}", hash.file_name()));
         let mut file = fs::OpenOptions::new()
             .read(true)
@@ -195,13 +194,13 @@ impl Store {
     ///
     /// The tree is rebuilt rather than patched: it belongs to one entry,
     /// and an entry is written once.
-    pub fn lay_out(&self, id: EntryId, files: &[FileRef]) -> Result<PathBuf> {
+    pub fn lay_out(&self, id: EntryId, files: &[FileRef]) -> eyre::Result<PathBuf> {
         let tree = self.tree(id);
         remove_tree(&tree);
         create_private(&tree)?;
 
         for file in files {
-            ensure!(file.is_safe(), "a peer sent an unusable path");
+            eyre::ensure!(file.is_safe(), "a peer sent an unusable path");
             let link = tree.join(&file.path);
             if let Some(parent) = link.parent() {
                 create_private(parent)?;
@@ -216,7 +215,7 @@ impl Store {
     /// Drops everything no live entry names: the trees of entries that are
     /// gone, the content nothing points at, and transfers abandoned when
     /// the entry that wanted them went away.
-    pub fn sweep(&self, entries: &BTreeSet<EntryId>, content: &BTreeSet<Hash>) -> Result<()> {
+    pub fn sweep(&self, entries: &BTreeSet<EntryId>, content: &BTreeSet<Hash>) -> eyre::Result<()> {
         let live: BTreeSet<String> = entries.iter().map(EntryId::label).collect();
         for tree in read_dir(&self.trees)? {
             if !tree
@@ -224,7 +223,7 @@ impl Store {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| live.contains(name))
             {
-                debug!("dropping the files of a gone entry: {}", tree.display());
+                tracing::debug!("dropping the files of a gone entry: {}", tree.display());
                 remove_tree(&tree);
             }
         }
@@ -242,7 +241,7 @@ impl Store {
                 .map(|name| name.strip_suffix(PARTIAL).unwrap_or(name))
                 .and_then(Hash::parse);
             if !named.is_some_and(|hash| content.contains(&hash) || pending.contains_key(&hash)) {
-                debug!("dropping unreferenced content: {}", blob.display());
+                tracing::debug!("dropping unreferenced content: {}", blob.display());
                 let _ = fs::remove_file(&blob);
             }
         }
@@ -269,7 +268,7 @@ impl Incoming {
     }
 
     /// Appends what arrived.
-    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn write(&mut self, bytes: &[u8]) -> eyre::Result<()> {
         self.file
             .write_all(bytes)
             .wrap_err_with(|| format!("cannot write {}", self.path.display()))?;
@@ -282,13 +281,13 @@ impl Incoming {
     /// the spool. A mismatch takes the file with it: what is left is not
     /// the content, and keeping it would have every later transfer resume
     /// on top of the wrong bytes.
-    pub fn finish(self, store: &Store) -> Result<()> {
+    pub fn finish(self, store: &Store) -> eyre::Result<()> {
         drop(self.file);
 
         let (hash, _) = hash_file(&self.path)?;
         if hash != self.hash {
             let _ = fs::remove_file(&self.path);
-            bail!("the content of {} is not what it was named", self.hash);
+            eyre::bail!("the content of {} is not what it was named", self.hash);
         }
 
         fs::rename(&self.path, store.blob(self.hash))
@@ -307,7 +306,7 @@ impl Incoming {
 /// Refuses rather than truncates when the selection is over `max_files` or
 /// `max_bytes`: half a folder is not the folder, and a paste that quietly
 /// dropped files would be worse than one that did not happen.
-pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> Result<Vec<Source>> {
+pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> eyre::Result<Vec<Source>> {
     let mut found = Vec::new();
     let mut total = 0u64;
 
@@ -322,7 +321,7 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> Result<Vec<S
             if !entry.file_type().is_file() {
                 if !entry.file_type().is_dir() {
                     let path = entry.path().display();
-                    debug!("skipping {path}, which is not a plain file");
+                    tracing::debug!("skipping {path}, which is not a plain file");
                 }
                 continue;
             }
@@ -346,8 +345,8 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> Result<Vec<S
             total = total
                 .checked_add(size)
                 .ok_or_else(|| color_eyre::eyre::eyre!("the selection is too large to share"))?;
-            ensure!(found.len() < max_files, "the selection has too many files");
-            ensure!(total <= max_bytes, "the selection is too large to share");
+            eyre::ensure!(found.len() < max_files, "the selection has too many files");
+            eyre::ensure!(total <= max_bytes, "the selection is too large to share");
             found.push(Source {
                 from: entry.path().to_owned(),
                 path: path.to_owned(),
@@ -359,7 +358,7 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> Result<Vec<S
     // Two files under one name is a selection that cannot be laid out on
     // the other machine, and there is no name to give the second that the
     // person copying would recognize.
-    ensure!(
+    eyre::ensure!(
         found.windows(2).all(|pair| pair[0].path != pair[1].path),
         "two of the files would land under the same name",
     );
@@ -370,7 +369,7 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> Result<Vec<S
 /// Copies a file, sharing the blocks with the original where the
 /// filesystem can: on btrfs, XFS, bcachefs and APFS, spooling a four
 /// gigabyte image costs a directory entry rather than four gigabytes.
-fn clone_file(source: &Path, dest: &Path) -> Result<()> {
+fn clone_file(source: &Path, dest: &Path) -> eyre::Result<()> {
     reflink_copy::reflink_or_copy(source, dest)
         .wrap_err_with(|| format!("cannot copy {}", source.display()))?;
 
@@ -378,7 +377,7 @@ fn clone_file(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// The hash and size of a file on disk.
-fn hash_file(path: &Path) -> Result<(Hash, u64)> {
+fn hash_file(path: &Path) -> eyre::Result<(Hash, u64)> {
     let mut file = File::open(path).wrap_err_with(|| format!("cannot read {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut chunk = vec![0u8; CHUNK];
@@ -401,7 +400,7 @@ fn hash_file(path: &Path) -> Result<(Hash, u64)> {
 }
 
 /// Every path in a directory, an absent directory counting as empty.
-fn read_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+fn read_dir(dir: &Path) -> eyre::Result<Vec<PathBuf>> {
     let listing = match fs::read_dir(dir) {
         Ok(listing) => listing,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -426,7 +425,7 @@ fn remove_tree(tree: &Path) {
     match fs::remove_dir_all(tree) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => warn!("cannot remove {}: {err}", tree.display()),
+        Err(err) => tracing::warn!("cannot remove {}: {err}", tree.display()),
     }
 }
 

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use color_eyre::eyre::{Result, bail, ensure};
+use color_eyre::eyre;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
@@ -96,8 +96,12 @@ impl Log {
     }
 
     /// Writes a local entry. `durable` decides whether it may be persisted.
-    pub fn append(&mut self, bytes: Payload, durable: bool) -> Result<(EntryId, Vec<Change>)> {
-        ensure!(
+    pub fn append(
+        &mut self,
+        bytes: Payload,
+        durable: bool,
+    ) -> eyre::Result<(EntryId, Vec<Change>)> {
+        eyre::ensure!(
             bytes.len() <= self.limits.payload,
             "entry is larger than the {} byte limit",
             self.limits.payload,
@@ -127,14 +131,14 @@ impl Log {
     /// refused, would leave entries in the log that never reached the
     /// history and never reached the disk, while still being announced to
     /// everyone else.
-    pub fn validate(&self, wire: &WireEntry) -> Result<()> {
+    pub fn validate(&self, wire: &WireEntry) -> eyre::Result<()> {
         // A peer writing under our identity could rewrite our history and
         // make every machine disagree about what our entries are.
         if wire.id.origin == self.origin {
-            bail!("a peer sent an entry under our own identity");
+            eyre::bail!("a peer sent an entry under our own identity");
         }
-        ensure!(wire.id.seq > 0, "an entry has no sequence number");
-        ensure!(
+        eyre::ensure!(wire.id.seq > 0, "an entry has no sequence number");
+        eyre::ensure!(
             wire.payload.len() <= self.limits.payload,
             "an entry is larger than the {} byte limit",
             self.limits.payload,
@@ -145,7 +149,7 @@ impl Log {
 
     /// Takes an entry from a peer. An entry we have already seen, or
     /// knowingly skipped, is ignored.
-    pub fn accept(&mut self, wire: WireEntry, durable: bool) -> Result<Vec<Change>> {
+    pub fn accept(&mut self, wire: WireEntry, durable: bool) -> eyre::Result<Vec<Change>> {
         self.validate(&wire)?;
 
         if !self.have.advance(wire.id.origin, wire.id.seq) {

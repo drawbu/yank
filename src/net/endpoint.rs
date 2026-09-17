@@ -1,9 +1,9 @@
 //! Binding the iroh endpoint that carries every peer connection.
 
-use color_eyre::eyre::Result;
 use iroh::{Endpoint, endpoint::presets};
 
 use crate::config::MachineKey;
+use color_eyre::eyre;
 
 /// How the endpoint reaches the network.
 #[derive(Debug, Clone, Default)]
@@ -41,7 +41,7 @@ pub async fn bind_endpoint(
     key: &MachineKey,
     alpns: Vec<Vec<u8>>,
     options: &EndpointOptions,
-) -> Result<Endpoint> {
+) -> eyre::Result<Endpoint> {
     match options {
         EndpointOptions::Production => Ok(Endpoint::builder(presets::N0)
             .secret_key(key.secret().clone())

@@ -2,7 +2,7 @@
 
 use std::{future::Future, io, time::Duration};
 
-use color_eyre::eyre::{Report, Result, WrapErr as _, bail};
+use color_eyre::eyre::{self, WrapErr as _};
 use tokio::net::UnixStream;
 
 use super::protocol::{MAX_MESSAGE_SIZE, Request, Response};
@@ -36,7 +36,7 @@ pub struct Client {
 
 impl Client {
     /// Connects to the daemon, or `None` when none is listening.
-    pub async fn connect(dirs: &Dirs) -> Result<Option<Self>> {
+    pub async fn connect(dirs: &Dirs) -> eyre::Result<Option<Self>> {
         let path = dirs.socket_file();
 
         match UnixStream::connect(&path).await {
@@ -54,30 +54,30 @@ impl Client {
     }
 
     /// Connects, failing with [`DaemonNotRunning`] when none is listening.
-    pub async fn connect_required(dirs: &Dirs) -> Result<Self> {
+    pub async fn connect_required(dirs: &Dirs) -> eyre::Result<Self> {
         Self::connect(dirs)
             .await?
-            .ok_or_else(|| Report::new(DaemonNotRunning))
+            .ok_or_else(|| eyre::Report::new(DaemonNotRunning))
     }
 
     /// Sends one request and returns the answer, turning a
     /// [`Response::Error`] into an error so callers only match the shape
     /// they asked for.
-    pub async fn request(&mut self, request: &Request, limit: Duration) -> Result<Response> {
+    pub async fn request(&mut self, request: &Request, limit: Duration) -> eyre::Result<Response> {
         write_message(&mut self.stream, request, MAX_MESSAGE_SIZE).await?;
 
         let read = read_message(&mut self.stream, MAX_MESSAGE_SIZE);
         match tokio::time::timeout(limit, read).await {
-            Ok(Ok(Response::Error(message))) => bail!("{message}"),
+            Ok(Ok(Response::Error(message))) => eyre::bail!("{message}"),
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => Err(err),
-            Err(_) => bail!("the daemon did not answer"),
+            Err(_) => eyre::bail!("the daemon did not answer"),
         }
     }
 }
 
 /// Runs a control operation on a current-thread Tokio runtime.
-pub fn talk<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+pub fn talk<T>(future: impl Future<Output = eyre::Result<T>>) -> eyre::Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -85,7 +85,7 @@ pub fn talk<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 }
 
 /// Sends one request to the daemon and returns its answer.
-pub fn request(dirs: &Dirs, request: &Request, limit: Duration) -> Result<Response> {
+pub fn request(dirs: &Dirs, request: &Request, limit: Duration) -> eyre::Result<Response> {
     talk(async {
         Client::connect_required(dirs)
             .await?

@@ -22,13 +22,12 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::spawn_blocking,
 };
-use tracing::{debug, info, warn};
 
 use super::{backoff::Backoff, clip::ClipService, peers::PeerSet};
 use crate::{
@@ -93,7 +92,7 @@ impl Spool {
     /// its way down, and files are not worth a panic.
     pub fn send(&self, job: Job) {
         if self.jobs.send(job).is_err() {
-            debug!("the file service is gone; dropping a job");
+            tracing::debug!("the file service is gone; dropping a job");
         }
     }
 }
@@ -138,7 +137,7 @@ pub async fn run(
                         return;
                     };
                     if let Err(err) = materialize(&clip, &peers, &settings, &spool, id).await {
-                        warn!("cannot bring the files of {id} here: {err:#}");
+                        tracing::warn!("cannot bring the files of {id} here: {err:#}");
                     }
                     asked.lock().unwrap().remove(&id);
                 });
@@ -164,25 +163,29 @@ async fn snapshot(
 
     match taken {
         Ok(Ok(files)) => {
-            info!("sharing {} file(s), {}", files.len(), size(&files));
+            tracing::info!("sharing {} file(s), {}", files.len(), size(&files));
             files
         }
         Ok(Err(err)) => {
-            debug!("sharing the paths as text: {err:#}");
+            tracing::debug!("sharing the paths as text: {err:#}");
             Vec::new()
         }
         Err(err) => {
-            warn!("the spool task failed: {err}");
+            tracing::warn!("the spool task failed: {err}");
             Vec::new()
         }
     }
 }
 
 /// Spools every file a selection names, or none of them.
-pub fn take_all(store: &Store, paths: &[PathBuf], settings: &Settings) -> Result<Vec<FileRef>> {
+pub fn take_all(
+    store: &Store,
+    paths: &[PathBuf],
+    settings: &Settings,
+) -> eyre::Result<Vec<FileRef>> {
     let budget = settings.file_budget.as_u64();
     let sources = files::walk(paths, MAX_FILES, settings.max_file_bytes())?;
-    ensure!(!sources.is_empty(), "the selection names no file");
+    eyre::ensure!(!sources.is_empty(), "the selection names no file");
 
     let wanted = sources.iter().try_fold(0u64, |total, source| {
         total
@@ -212,8 +215,8 @@ pub fn take_all(store: &Store, paths: &[PathBuf], settings: &Settings) -> Result
 
 /// Refuses what the spool has no room for. Counted once, since walking the
 /// spool is a directory listing and a stat per file in it.
-fn room(store: &Store, wanted: u64, budget: u64) -> Result<()> {
-    ensure!(
+fn room(store: &Store, wanted: u64, budget: u64) -> eyre::Result<()> {
+    eyre::ensure!(
         store.size() + wanted <= budget,
         "the spool has no room for another {} under its {} budget in config.toml",
         bytesize::ByteSize::b(wanted),
@@ -231,13 +234,13 @@ async fn materialize(
     settings: &Settings,
     spool: &Spool,
     id: EntryId,
-) -> Result<()> {
+) -> eyre::Result<()> {
     let files = clip.files(id);
     if files.is_empty() {
         return Ok(());
     }
     let total = files::total(&files)?;
-    ensure!(
+    eyre::ensure!(
         total <= settings.max_file_bytes(),
         "it is over the {} limit in config.toml",
         settings.max_file_size,
@@ -251,7 +254,7 @@ async fn materialize(
             Ok(()) => break,
             Err(err) if attempt == RETRIES => return Err(err),
             Err(err) => {
-                debug!("cannot fetch the files of {id} yet: {err:#}");
+                tracing::debug!("cannot fetch the files of {id} yet: {err:#}");
                 tokio::time::sleep(backoff.next_delay()).await;
             }
         }
@@ -261,7 +264,7 @@ async fn materialize(
     let tree = spawn_blocking(move || store.lay_out(id, &laid_out))
         .await
         .wrap_err("the spool task failed")??;
-    info!("{} file(s) of {id} are here, {}", files.len(), size(&files));
+    tracing::info!("{} file(s) of {id} are here, {}", files.len(), size(&files));
     clip.materialized(id, tree);
 
     Ok(())
@@ -273,7 +276,7 @@ async fn pull_all(
     peers: &PeerSet,
     origin: EndpointId,
     files: &[FileRef],
-) -> Result<()> {
+) -> eyre::Result<()> {
     for file in files {
         if store.has(file.hash) {
             continue;
@@ -286,11 +289,11 @@ async fn pull_all(
                     found = true;
                     break;
                 }
-                Ok(false) => debug!("{peer} does not have {}", file.hash),
-                Err(err) => debug!("cannot pull {} from {peer}: {err:#}", file.hash),
+                Ok(false) => tracing::debug!("{peer} does not have {}", file.hash),
+                Err(err) => tracing::debug!("cannot pull {} from {peer}: {err:#}", file.hash),
             }
         }
-        ensure!(found, "no machine that is up has {}", file.hash);
+        eyre::ensure!(found, "no machine that is up has {}", file.hash);
     }
 
     Ok(())
@@ -298,7 +301,7 @@ async fn pull_all(
 
 /// Pulls one file from one peer, resuming where a previous attempt left
 /// off. Answers whether that peer had it at all.
-async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> Result<bool> {
+async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> eyre::Result<bool> {
     let mut incoming = {
         let (store, hash) = (store.clone(), file.hash);
         spawn_blocking(move || store.receive(hash))
@@ -320,7 +323,7 @@ async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> Result<b
         ContentReply::Missing => return Ok(false),
         ContentReply::Sending { size } => size,
     };
-    ensure!(
+    eyre::ensure!(
         at.checked_add(size) == Some(file.size),
         "a peer offered {} bytes where the entry says {}",
         at.saturating_add(size),
@@ -348,7 +351,7 @@ async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> Result<b
             .await
             .wrap_err("the transfer stalled")??;
         match read {
-            Some(0) | None => bail!("the transfer stopped {left} bytes short"),
+            Some(0) | None => eyre::bail!("the transfer stopped {left} bytes short"),
             Some(read) => {
                 left -= read as u64;
                 chunks
@@ -379,7 +382,7 @@ fn sweep(clip: &ClipService, store: &Arc<Store>) {
 
     tokio::task::spawn_blocking(move || {
         if let Err(err) = store.sweep(&entries, &content) {
-            warn!("cannot sweep the file spool: {err:#}");
+            tracing::warn!("cannot sweep the file spool: {err:#}");
         }
     });
 }

@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use etcetera::BaseStrategy as _;
 
 /// The resolved directories of one `yank` installation.
@@ -34,10 +34,10 @@ impl Dirs {
     /// Resolves the XDG directories, or puts everything under `override_root`
     /// when given. An overridden root is created if missing, like the XDG
     /// ones: it exists to be pointed at an empty path.
-    pub fn new(override_root: Option<PathBuf>) -> Result<Self> {
+    pub fn new(override_root: Option<PathBuf>) -> eyre::Result<Self> {
         if let Some(root) = override_root {
             create_private(&root)?;
-            ensure!(root.is_dir(), "{} is not a directory", root.display());
+            eyre::ensure!(root.is_dir(), "{} is not a directory", root.display());
 
             return Ok(Dirs {
                 config: root.clone(),
@@ -125,7 +125,7 @@ impl Dirs {
 
 /// Creates a directory and every missing parent, readable by its owner
 /// only: these hold the identity key and the clipboard history.
-pub fn create_private(path: &Path) -> Result<()> {
+pub fn create_private(path: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
     fs::DirBuilder::new()
@@ -138,7 +138,7 @@ pub fn create_private(path: &Path) -> Result<()> {
 /// Writes a file atomically and owner-only, by writing a sibling and
 /// renaming it into place: a crash mid-write must never leave a truncated
 /// file where a valid one was.
-pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
 
     let tmp = path.with_extension("tmp");

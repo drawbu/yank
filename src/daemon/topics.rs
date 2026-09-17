@@ -11,13 +11,12 @@
 
 use std::sync::Arc;
 
-use color_eyre::eyre::Result;
-
 use super::{clip::ClipService, hub::Hub};
 use crate::{
     log::{Watermark, WireEntry},
     net::proto::{self, Topic},
 };
+use color_eyre::eyre;
 
 /// Every replicated feature this daemon runs.
 #[derive(Debug)]
@@ -41,7 +40,7 @@ impl Topics {
     }
 
     /// Takes a batch of entries from a peer.
-    pub fn accept(&self, topic: Topic, entries: Vec<WireEntry>) -> Result<()> {
+    pub fn accept(&self, topic: Topic, entries: Vec<WireEntry>) -> eyre::Result<()> {
         match topic {
             Topic::Clipboard => self.clipboard.accept(entries),
         }

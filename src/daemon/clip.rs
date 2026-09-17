@@ -22,11 +22,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{self, WrapErr as _};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
-use tracing::{debug, info, warn};
 
 use super::{
     backoff::Backoff,
@@ -113,7 +112,7 @@ impl ClipService {
         settings: Arc<Settings>,
         hub: Arc<Hub>,
         spool: Spool,
-    ) -> Result<Arc<Self>> {
+    ) -> eyre::Result<Arc<Self>> {
         let persisted = load_persisted(dirs)?;
         let history = dirs.history_dir();
 
@@ -155,7 +154,7 @@ impl ClipService {
     }
 
     /// Takes a batch of entries from a peer.
-    pub fn accept(&self, entries: Vec<WireEntry>) -> Result<()> {
+    pub fn accept(&self, entries: Vec<WireEntry>) -> eyre::Result<()> {
         let effects = self.board.lock().unwrap().accept(entries)?;
         self.perform(effects);
 
@@ -163,7 +162,7 @@ impl ClipService {
     }
 
     /// Copies something from this machine.
-    pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> Result<EntryId> {
+    pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> eyre::Result<EntryId> {
         let (id, effects) =
             self.board
                 .lock()
@@ -184,8 +183,8 @@ impl ClipService {
         self: &Arc<Self>,
         paths: Vec<PathBuf>,
         ttl: Option<Duration>,
-    ) -> Result<EntryId> {
-        ensure!(
+    ) -> eyre::Result<EntryId> {
+        eyre::ensure!(
             self.settings.files,
             "sharing files is turned off in config.toml",
         );
@@ -218,13 +217,13 @@ impl ClipService {
     /// large, and a caller polling for the answer would ask hundreds of
     /// times to be told the same thing. Past the deadline the answer says
     /// they are not here; the fetch carries on regardless.
-    pub async fn located(&self, needle: Option<&str>, within: Duration) -> Result<Located> {
+    pub async fn located(&self, needle: Option<&str>, within: Duration) -> eyre::Result<Located> {
         let (id, files) = {
             let board = self.board.lock().unwrap();
             let id = board.named(needle)?.id;
             let files = board.files(id);
-            ensure!(!files.is_empty(), "entry {id} names no file");
-            ensure!(
+            eyre::ensure!(!files.is_empty(), "entry {id} names no file");
+            eyre::ensure!(
                 !board.is_local(id),
                 "entry {id} was copied here; its files are where they always were",
             );
@@ -267,7 +266,7 @@ impl ClipService {
         let recorded = self.board.lock().unwrap().captured(captured, files);
         match recorded {
             Ok(effects) => self.perform(effects),
-            Err(err) => warn!("cannot record the selection: {err:#}"),
+            Err(err) => tracing::warn!("cannot record the selection: {err:#}"),
         }
     }
 
@@ -290,7 +289,7 @@ impl ClipService {
     }
 
     /// Makes an entry already in the history the selection again.
-    pub fn pick(&self, needle: &str) -> Result<EntryId> {
+    pub fn pick(&self, needle: &str) -> eyre::Result<EntryId> {
         let mut board = self.board.lock().unwrap();
         let id = board.resolve(needle)?.id;
         let (picked, effects) = board.pick(id)?;
@@ -309,7 +308,7 @@ impl ClipService {
         &self,
         needle: Option<&str>,
         mime: Option<&str>,
-    ) -> Result<(String, Vec<String>, Vec<u8>)> {
+    ) -> eyre::Result<(String, Vec<String>, Vec<u8>)> {
         let board = self.board.lock().unwrap();
         let id = board.named(needle)?.id;
         let copy = board.body(id)?;
@@ -342,7 +341,7 @@ impl ClipService {
     }
 
     /// Drops one entry from every machine.
-    pub fn forget(&self, needle: &str) -> Result<EntryId> {
+    pub fn forget(&self, needle: &str) -> eyre::Result<EntryId> {
         let mut board = self.board.lock().unwrap();
         let id = board.resolve(needle)?.id;
         let effects = board.forget(id)?;
@@ -353,7 +352,7 @@ impl ClipService {
     }
 
     /// Empties the clipboard everywhere, and the history too when asked.
-    pub fn clear(&self, history: bool) -> Result<()> {
+    pub fn clear(&self, history: bool) -> eyre::Result<()> {
         let mut board = self.board.lock().unwrap();
         let mut effects = board.clear()?;
         if history {
@@ -366,7 +365,7 @@ impl ClipService {
     }
 
     /// Pauses or resumes a direction of the clipboard.
-    pub fn set_pause(&self, capture: Option<Switch>, apply: Option<Switch>) -> Result<Pause> {
+    pub fn set_pause(&self, capture: Option<Switch>, apply: Option<Switch>) -> eyre::Result<Pause> {
         let mut board = self.board.lock().unwrap();
         let effects = board.set_pause(capture, apply);
         let pause = board.pause();
@@ -431,7 +430,7 @@ impl ClipService {
         }
 
         if let Err(err) = self.persist() {
-            warn!("cannot save the clipboard state: {err:#}");
+            tracing::warn!("cannot save the clipboard state: {err:#}");
         }
         self.hub.announce(Topic::Clipboard, self.have());
         self.wake.notify_one();
@@ -442,7 +441,7 @@ impl ClipService {
         if let Some(backend) = &*self.backend.lock().unwrap() {
             backend.send(command);
         } else {
-            debug!("no clipboard backend; dropping {command:?}");
+            tracing::debug!("no clipboard backend; dropping {command:?}");
         }
     }
 
@@ -452,7 +451,7 @@ impl ClipService {
     /// renamed into place. Losing it would make this machine reuse entry
     /// numbers it already used, which every other machine would then
     /// ignore as already seen.
-    fn persist(&self) -> Result<()> {
+    fn persist(&self) -> eyre::Result<()> {
         let board = self.board.lock().unwrap();
         let persisted = Persisted {
             checkpoint: board.checkpoint(),
@@ -523,7 +522,10 @@ impl ClipService {
     /// Connecting means a round trip to the compositor, which is a
     /// blocking call on a process that may be busy or wedged, so it does
     /// not run on the async runtime.
-    async fn connect_backend(&self, events: &mpsc::UnboundedSender<backend::Event>) -> Result<()> {
+    async fn connect_backend(
+        &self,
+        events: &mpsc::UnboundedSender<backend::Event>,
+    ) -> eyre::Result<()> {
         let events = events.clone();
         let policy = Policy {
             max_bytes: self.settings.max_entry_bytes(),
@@ -536,7 +538,7 @@ impl ClipService {
 
         *self.backend.lock().unwrap() = Some(backend);
         *self.down.lock().unwrap() = None;
-        info!("clipboard connected");
+        tracing::info!("clipboard connected");
 
         Ok(())
     }
@@ -567,7 +569,7 @@ impl ClipService {
                 false
             }
             backend::Event::Lost(reason) => {
-                warn!("clipboard disconnected: {reason}");
+                tracing::warn!("clipboard disconnected: {reason}");
                 // Taken out of the lock before it is dropped: dropping a
                 // backend waits for its thread.
                 let backend = self.backend.lock().unwrap().take();
@@ -608,13 +610,13 @@ fn next_wake(service: &ClipService, reconnect_at: Option<Instant>) -> Duration {
 
 /// Reads `clip.json`, treating a missing or unreadable file as empty: it
 /// costs the entry numbering a restart, not the daemon.
-fn load_persisted(dirs: &Dirs) -> Result<Persisted> {
+fn load_persisted(dirs: &Dirs) -> eyre::Result<Persisted> {
     let path = dirs.clip_file();
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(persisted) => Ok(persisted),
             Err(err) => {
-                warn!("cannot read {}: {err}", path.display());
+                tracing::warn!("cannot read {}: {err}", path.display());
                 Ok(Persisted::default())
             }
         },

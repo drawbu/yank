@@ -4,15 +4,15 @@
 //! `RUST_LOG=yank=debug` when something needs looking at.
 
 use clap::Args;
-use color_eyre::eyre::Result;
 
 use crate::{config::Dirs, daemon};
+use color_eyre::eyre;
 
 /// Run the daemon in the foreground
 #[derive(Debug, Args)]
 pub struct DaemonArgs {}
 
-pub fn run(_args: &DaemonArgs, dirs: &Dirs) -> Result<()> {
+pub fn run(_args: &DaemonArgs, dirs: &Dirs) -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
