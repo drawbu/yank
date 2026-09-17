@@ -26,6 +26,9 @@ use std::{
     collections::HashMap,
     io::Write as _,
     os::fd::{AsFd as _, OwnedFd},
+    os::unix::net::UnixStream,
+    path::{Path, PathBuf},
+    process::Command as SystemCommand,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -35,7 +38,7 @@ use color_eyre::eyre::{self, WrapErr as _};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::mpsc as tokio_mpsc;
 use wayland_client::{
-    Connection, QueueHandle,
+    ConnectError, Connection, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_registry::WlRegistry, wl_seat::WlSeat},
 };
@@ -139,6 +142,54 @@ impl Drop for Wayland {
     }
 }
 
+/// Connects to the compositor the session runs, taking its socket from the
+/// environment, then from the user manager's imported environment when the
+/// session restarted and the process env is stale.
+fn connect_compositor() -> eyre::Result<Connection> {
+    match Connection::connect_to_env() {
+        Ok(connection) => return Ok(connection),
+        // A `WAYLAND_SOCKET` fd passed in is deliberate, and a backend
+        // that fails to load will not be fixed by asking the session.
+        Err(ConnectError::NoCompositor) => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let socket = session_socket()?;
+    tracing::debug!("the session's compositor is at {}", socket.display());
+    let stream = UnixStream::connect(&socket)
+        .wrap_err_with(|| format!("cannot connect to {}", socket.display()))?;
+    Connection::from_socket(stream).map_err(Into::into)
+}
+
+/// The compositor socket the session holds: `WAYLAND_DISPLAY` as the user
+/// manager's imported environment names it, resolved against this daemon's
+/// `$XDG_RUNTIME_DIR`.
+fn session_socket() -> eyre::Result<PathBuf> {
+    let output = SystemCommand::new("systemctl")
+        .args(["--user", "show-environment"])
+        .output()
+        .wrap_err("systemctl did not answer")?;
+    if !output.status.success() {
+        eyre::bail!(
+            "systemctl did not answer: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+
+    let display = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("WAYLAND_DISPLAY="))
+        .map(PathBuf::from)
+        .ok_or_else(|| eyre::eyre!("the user manager knows no wayland display"))?;
+    if display.is_absolute() {
+        return Ok(display);
+    }
+
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| eyre::eyre!("XDG_RUNTIME_DIR is not set"))?;
+    Ok(Path::new(&runtime).join(display))
+}
+
 /// Everything the backend thread owns.
 struct Session {
     connection: Connection,
@@ -203,7 +254,7 @@ impl Session {
     /// Connects, binds the globals and picks up the selection already on
     /// the clipboard.
     fn connect(events: tokio_mpsc::UnboundedSender<Event>, policy: Policy) -> eyre::Result<Self> {
-        let connection = Connection::connect_to_env()
+        let connection = connect_compositor()
             .wrap_err("cannot connect to the Wayland compositor (is WAYLAND_DISPLAY set?)")?;
         let (globals, queue) = registry_queue_init::<State>(&connection)
             .wrap_err("cannot read the Wayland globals")?;
