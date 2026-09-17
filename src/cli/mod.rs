@@ -8,7 +8,7 @@ mod service;
 mod status;
 mod ui;
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 
@@ -89,16 +89,39 @@ pub fn run() -> eyre::Result<()> {
     }
 }
 
-/// Prints a failure. The expected "no daemon" case prints as a plain
-/// sentence: not having started it yet is not a bug to report.
-pub fn report_error(err: &eyre::Report) {
-    let message = if err.is::<crate::daemon::control::DaemonNotRunning>() {
-        format!("{err:#}")
-    } else {
-        format!("Error: {err:#}")
+/// Outcomes that are situations to act on, not failures to debug.
+///
+/// The CLI prints them as a plain sentence, without the error dressing,
+/// and exits with the sysexits code that names the situation.
+#[derive(Debug, thiserror::Error)]
+pub enum Situation {
+    #[error("The yank daemon is not running. Start it with `yank service start`.")]
+    DaemonNotRunning,
+    #[error("The files of {label} have not arrived; the daemon is still trying.")]
+    FilesPending { label: String },
+}
+
+impl Situation {
+    fn exit_code(&self) -> ExitCode {
+        const EX_UNAVAILABLE: u8 = 69;
+        const EX_TEMPFAIL: u8 = 75;
+
+        match self {
+            Situation::DaemonNotRunning => ExitCode::from(EX_UNAVAILABLE),
+            Situation::FilesPending { .. } => ExitCode::from(EX_TEMPFAIL),
+        }
+    }
+}
+
+/// Prints a failure and returns the exit code it deserves.
+pub fn report_error(err: &eyre::Report) -> ExitCode {
+    let (message, code) = match err.downcast_ref::<Situation>() {
+        Some(situation) => (format!("{err:#}"), situation.exit_code()),
+        None => (format!("Error: {err:#}"), ExitCode::FAILURE),
     };
 
     anstream::eprintln!("{}", ui::bad(message));
+    code
 }
 
 fn parse_duration(text: &str) -> eyre::Result<Duration, String> {

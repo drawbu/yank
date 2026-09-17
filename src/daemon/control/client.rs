@@ -7,26 +7,10 @@ use tokio::net::UnixStream;
 
 use super::protocol::{MAX_MESSAGE_SIZE, Request, Response};
 use crate::{
+    cli::Situation,
     config::Dirs,
     net::wire::{read_message, write_message},
 };
-
-/// What every command that needs the daemon fails with when none is
-/// running.
-///
-/// The CLI recognizes this and prints it plainly, without the error
-/// dressing: not having started the daemon yet is a situation, not a
-/// failure to debug.
-#[derive(Debug)]
-pub struct DaemonNotRunning;
-
-impl std::fmt::Display for DaemonNotRunning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The yank daemon is not running. Start it with `yank service start`.")
-    }
-}
-
-impl std::error::Error for DaemonNotRunning {}
 
 /// A connection to the daemon.
 #[derive(Debug)]
@@ -53,11 +37,12 @@ impl Client {
         }
     }
 
-    /// Connects, failing with [`DaemonNotRunning`] when none is listening.
+    /// Connects, failing with [`Situation::DaemonNotRunning`] when none is
+    /// listening.
     pub async fn connect_required(dirs: &Dirs) -> eyre::Result<Self> {
         Self::connect(dirs)
             .await?
-            .ok_or_else(|| eyre::Report::new(DaemonNotRunning))
+            .ok_or_else(|| eyre::Report::new(Situation::DaemonNotRunning))
     }
 
     /// Sends one request and returns the answer, turning a

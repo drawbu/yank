@@ -5,9 +5,6 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     match yank::cli::run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            yank::cli::report_error(&err);
-            ExitCode::FAILURE
-        }
+        Err(err) => yank::cli::report_error(&err),
     }
 }

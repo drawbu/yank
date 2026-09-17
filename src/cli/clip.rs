@@ -10,7 +10,7 @@ use std::{
 use clap::Args;
 use eyre::WrapErr as _;
 
-use super::{parse_duration, ui};
+use super::{Situation, parse_duration, ui};
 use crate::{
     clip::mime::PLAIN_TEXT,
     config::Dirs,
@@ -214,7 +214,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
         return unexpected(&response);
     };
     let Some(tree) = tree else {
-        eyre::bail!("the files of {label} have not arrived; the daemon is still trying");
+        return Err(Situation::FilesPending { label }.into());
     };
     let tree = PathBuf::from(tree);
 
