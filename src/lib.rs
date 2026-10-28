@@ -1,8 +1,8 @@
 //! Peer-to-peer clipboard replication over [iroh](https://www.iroh.computer/).
 //!
-//! Each machine keeps a bounded append-only log of clipboard events and
-//! synchronizes missing entries directly with its paired peers. The daemon
-//! owns the mesh and clipboard state; the CLI talks to it through a Unix socket.
+//! Every machine holds the latest copy made anywhere on the mesh, and
+//! replicates it directly to its paired peers. The daemon owns the mesh and
+//! clipboard state; the CLI talks to it through a Unix socket.
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::doc_markdown)]
@@ -17,7 +17,6 @@ pub mod clip;
 pub mod config;
 pub mod daemon;
 pub mod files;
-pub mod log;
 pub mod net;
 
 /// The Cargo version, with the Nix source revision when available.

@@ -8,23 +8,21 @@ use std::time::{Duration, SystemTime};
 
 use clap::Args;
 
-use super::{parse_duration, ui};
+use super::{
+    client::{request, unexpected},
+    parse_duration, ui,
+};
 use crate::{
     clip::{Pause, Switch},
     config::Dirs,
-    daemon::control::{CLIENT_TIMEOUT, Request, Response, request},
+    daemon::control::{Request, Response},
 };
 
 /// Stop sharing the clipboard, in one direction or both
 #[derive(Debug, Args)]
 pub struct PauseArgs {
-    /// Stop sharing what is copied here
-    #[arg(long)]
-    capture: bool,
-
-    /// Stop taking what other machines copy
-    #[arg(long)]
-    apply: bool,
+    #[command(flatten)]
+    directions: Directions,
 
     /// Resume on its own after this long, for example `30m`
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -34,48 +32,50 @@ pub struct PauseArgs {
 /// Start sharing the clipboard again
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
-    /// Resume sharing what is copied here
+    #[command(flatten)]
+    directions: Directions,
+}
+
+/// The directions a command names. Naming none means both, which is what
+/// a bare `yank pause` should do.
+#[derive(Debug, Args)]
+struct Directions {
+    /// Only what is copied here
     #[arg(long)]
     capture: bool,
 
-    /// Resume taking what other machines copy
+    /// Only what other machines copy
     #[arg(long)]
     apply: bool,
 }
 
 pub fn pause(args: &PauseArgs, dirs: &Dirs) -> eyre::Result<()> {
     let until = args.r#for.map(|delay| SystemTime::now() + delay);
-    let switch = Switch::Paused { until };
-    let (capture, apply) = directions(args.capture, args.apply, switch);
 
-    apply_pause(dirs, capture, apply)
+    args.directions.set(dirs, Switch::Paused { until })
 }
 
 pub fn resume(args: &ResumeArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let (capture, apply) = directions(args.capture, args.apply, Switch::On);
-
-    apply_pause(dirs, capture, apply)
+    args.directions.set(dirs, Switch::On)
 }
 
-/// Which directions the flags name. Naming none means both, which is what
-/// a bare `yank pause` should do.
-fn directions(capture: bool, apply: bool, switch: Switch) -> (Option<Switch>, Option<Switch>) {
-    if !capture && !apply {
-        return (Some(switch), Some(switch));
+impl Directions {
+    /// Turns the named directions to `switch`.
+    fn set(&self, dirs: &Dirs, switch: Switch) -> eyre::Result<()> {
+        let both = !self.capture && !self.apply;
+        let set = Request::SetPause {
+            capture: (both || self.capture).then_some(switch),
+            apply: (both || self.apply).then_some(switch),
+        };
+        let response = request(dirs, &set)?;
+        let Response::Paused(pause) = response else {
+            return Err(unexpected(&response));
+        };
+
+        anstream::println!("{}", describe(pause));
+
+        Ok(())
     }
-
-    (capture.then_some(switch), apply.then_some(switch))
-}
-
-fn apply_pause(dirs: &Dirs, capture: Option<Switch>, apply: Option<Switch>) -> eyre::Result<()> {
-    let response = request(dirs, &Request::SetPause { capture, apply }, CLIENT_TIMEOUT)?;
-    let Response::Paused(pause) = response else {
-        eyre::bail!("unexpected answer from the daemon: {response:?}");
-    };
-
-    anstream::println!("{}", describe(pause));
-
-    Ok(())
 }
 
 /// One line saying what is running now.

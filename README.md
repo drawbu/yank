@@ -3,25 +3,25 @@
 `yank` replicates the clipboard across your machines over a peer-to-peer
 private mesh (using [iroh]), with no server in between.
 
-All the machines connected to your mesh share the same clipboard and recent
-history.
+All the machines connected to your mesh share the same clipboard: whatever
+was copied last, on any of them, is what every one of them pastes.
 
-- Clipboard is share *almost* instantly.
+- Clipboard is shared *almost* instantly.
 - Support pausing/resuming gracefully.
-- Catches up when a machine is off, asleep or offline, and it comes back.
+- Catches up with the latest copy when a machine is off, asleep or offline,
+  and comes back.
 - Support copying files
 - Support for sharing secret with a lifetime (like copying from a password manager).
 
 ```console
 $ yank status
 This machine 66a7e0c4ab0aa85615819f5257ad995e5b6f1cef3fc6e0bf412e818f7c8ea559
-  yank 0.1.0, up for 2h 14m
+  yank 0.2.0, up for 2h 14m
   clipboard connected
   Sharing in both directions
 
 Clipboard
   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample user@host — desktop, 41s ago
-  62 entries shared
 
 Machines
   desktop  connected direct [2a01:cb19:57:7500:a050:1baa:1f9a:c74c]:57148, 3ms, for 2h 13m
@@ -32,8 +32,8 @@ and read though your clipboard at all time, so be carefull.
 
 Sway, niri, Hyprland, KDE and most others Wayland compositors are supported.
 Tho, there is no X11, Gnome, or macOS support (more on that later). You can even
-add a machine with no graphical session to take part to replicate your history
-even when host are not online at the same time, and to use the CLI.
+add a machine with no graphical session to take part: it relays the latest
+copy between hosts that are not online at the same time, and serves the CLI.
 
 <details>
   <summary> Missing support (macOS, Gnome, and X11) </summary>
@@ -78,7 +78,6 @@ Home Manager:
   };
 }
 ```
-> Do not run `yank service install` there, as it would shadow the nix service.
 
 ## Usage
 
@@ -101,11 +100,8 @@ Here are some useful commands. See `yank help`.
 $ echo hi | yank copy       # copy from a pipe, like wl-copy
 $ yank copy -f ./photos     # copy files, contents and all
 $ yank paste                # print the clipboard, for pipes
-$ yank get abc123-4         # write an entry's files here
-$ yank list                 # the shared history, newest first
-$ yank pick abc123-4        # put one of those back on the clipboard
-$ yank rm abc123-4          # remove one entry from every machine
-$ yank clear [--history]    # empty every machine's clipboard
+$ yank get                  # write the copied files here
+$ yank clear                # empty every machine's clipboard
 $ yank copy --secret        # gone everywhere in 90 seconds
 $ yank pause [--capture|--apply] [--for 30m]
 $ yank resume
@@ -119,8 +115,11 @@ Connections are mutually authenticated with a per-machine Ed25519 key and
 end-to-end encrypted.
 See [iroh's Security & Privacy](https://docs.iroh.computer/concepts/security-privacy).
 
-Non-secret history and copied files are stored in `~/.local/state/yank` in
-plain.
+Every paired machine is trusted with the whole mesh: it reads every copy, and
+the machines it pairs with or removes are paired or removed everywhere.
+
+The latest non-secret copy and copied files are stored in
+`~/.local/state/yank` in plain.
 
 ## Contributing
 

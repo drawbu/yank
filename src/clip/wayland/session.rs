@@ -27,7 +27,7 @@ trait Manager {
 /// manager knows no display.
 ///
 /// Fails when there is no user manager on the session bus.
-pub async fn wayland_socket() -> eyre::Result<Option<PathBuf>> {
+pub async fn session_socket() -> eyre::Result<Option<PathBuf>> {
     let bus = zbus::Connection::session()
         .await
         .wrap_err("cannot reach the session bus")?;

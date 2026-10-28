@@ -11,13 +11,13 @@
 //! control socket and may read it directly for pre-checks, treating what
 //! it sees as advisory.
 
-use std::{cmp, collections::BTreeMap, fs, io::ErrorKind};
+use std::{cmp, collections::BTreeMap, fs};
 
 use eyre::WrapErr as _;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use super::{Dirs, validate_name, write_private};
+use super::{Dirs, read_existing, validate_name, write_private};
 
 /// Cap on the machines tracked, tombstones included. A personal mesh is a
 /// handful of machines; the cap keeps a peer from growing the state file,
@@ -58,13 +58,6 @@ pub enum PeerStatus {
     Removed,
 }
 
-/// What one machine gossips: its whole view of the mesh, sent as an
-/// idempotent snapshot on connect, on every change, and periodically.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Membership {
-    pub peers: BTreeMap<EndpointId, Peer>,
-}
-
 impl Peer {
     /// The machine's name while it is in the mesh; `None` for a tombstone.
     pub fn name(&self) -> Option<&str> {
@@ -94,12 +87,8 @@ impl MeshState {
     /// Loads `mesh.json`, treating a missing file as an empty mesh.
     pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.mesh_file();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
-            }
+        let Some(text) = read_existing(&path, fs::read_to_string)? else {
+            return Ok(Self::default());
         };
 
         serde_json::from_str(&text).wrap_err_with(|| format!("cannot parse {}", path.display()))
@@ -111,13 +100,6 @@ impl MeshState {
         let path = dirs.mesh_file();
         let text = serde_json::to_vec_pretty(self).expect("mesh state must serialize");
         write_private(&path, &text)
-    }
-
-    /// The view to gossip.
-    pub fn membership(&self) -> Membership {
-        Membership {
-            peers: self.peers.clone(),
-        }
     }
 
     /// The machines currently in the mesh, with their names.
@@ -169,7 +151,7 @@ impl MeshState {
     /// Checked before pairing, so a refusal reaches the other side while
     /// it is still listening.
     pub fn validate_new_peer(&self, name: &str, id: &EndpointId) -> eyre::Result<()> {
-        validate_name("machine", name)?;
+        validate_name(name)?;
         eyre::ensure!(
             self.peers.len() < MAX_MESH_PEERS || self.peers.contains_key(id),
             "the mesh already has {MAX_MESH_PEERS} machines",
@@ -214,7 +196,7 @@ impl MeshState {
     /// machine removed by someone else therefore keeps its own record
     /// alive, but every peer refuses it, which is the same outcome without
     /// the risk of a peer editing our identity.
-    pub fn merge(&mut self, remote: &Membership, local: &EndpointId) {
+    pub fn merge(&mut self, remote: &MeshState, local: &EndpointId) {
         for (id, record) in &remote.peers {
             // Strictly below the ceiling: a record *at* it could never be
             // superseded by a local change.
@@ -222,7 +204,7 @@ impl MeshState {
                 continue;
             }
             if let PeerStatus::Alive { name } = &record.status
-                && validate_name("machine", name).is_err()
+                && validate_name(name).is_err()
             {
                 continue;
             }
@@ -262,14 +244,14 @@ mod tests {
         iroh::SecretKey::generate().public()
     }
 
-    fn membership(id: EndpointId, version: u64, name: Option<&str>) -> Membership {
+    fn membership(id: EndpointId, version: u64, name: Option<&str>) -> MeshState {
         let status = match name {
             Some(name) => PeerStatus::Alive {
                 name: name.to_owned(),
             },
             None => PeerStatus::Removed,
         };
-        Membership {
+        MeshState {
             peers: BTreeMap::from([(id, Peer { version, status })]),
         }
     }

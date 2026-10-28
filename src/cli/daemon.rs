@@ -5,15 +5,9 @@
 
 use std::io::IsTerminal as _;
 
-use clap::Args;
-
 use crate::{config::Dirs, daemon};
 
-/// Run the daemon in the foreground
-#[derive(Debug, Args)]
-pub struct DaemonArgs {}
-
-pub fn run(_args: &DaemonArgs, dirs: &Dirs) -> eyre::Result<()> {
+pub fn run(dirs: &Dirs) -> eyre::Result<()> {
     tracing_subscriber::fmt()
         // Under the service, stdout is the journal: no colour codes there.
         .with_ansi(std::io::stdout().is_terminal())

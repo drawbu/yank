@@ -5,52 +5,49 @@
 //! either. The CLI is a client of it.
 //!
 //! ```text
-//!                        ┌───────────────────────── daemon ──┐
-//!   CLI ── unix socket ──┤ control ─┐                        │
-//!                        │          ├─► clipboard ◄─► topics │
-//!   compositor ──────────┤ backend ─┘    │   │          │    │
-//!                        │               │   ▼          ▼    │
-//!   peers ── QUIC ───────┤ peer tasks ◄──┼─ hub       mesh   │
-//!                        │               ▼                   │
-//!                        │             files ─► the spool    │
-//!                        └───────────────────────────────────┘
+//!                        ┌────────────────────────────────── daemon ─┐
+//!   CLI ── unix socket ──┤ control ──┐                               │
+//!   compositor ──────────┤ backend ──┴─► clipboard ─► files ─► spool │
+//!                        │                 ▲     │                   │
+//!                        │            pull │     ▼ head              │
+//!   peers ── QUIC ───────┤ peer tasks ─────┴─────┘                   │
+//!                        │      │      ▲                             │
+//!                        │ merge▼      │ gossip                      │
+//!                        │     mesh state                            │
+//!                        └───────────────────────────────────────────┘
 //! ```
 //!
-//! Subsystems talk through the types they share, never directly: the
-//! the `hub` carries what the clipboard has to say to peers, `topics` is
-//! how a peer's entries find their way back to a feature, `store` owns
-//! the mesh state everything else reads, and `files` is where everything
-//! slow about a copied file happens, off the clipboard's path.
+//! The clipboard and `store` publish the head and the mesh state, every
+//! peer connection watches both and gossips them on, and merges what its
+//! peer gossips back. The peer tasks pull a newer clip into the clipboard,
+//! and `files` is where everything slow about a copied file happens, off
+//! the clipboard's path.
 
 mod backoff;
 pub mod clip;
 pub mod control;
 pub mod files;
-mod hub;
 mod pairing;
 mod peers;
 mod store;
-mod topics;
 
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use iroh::{Endpoint, EndpointId};
-use tokio::sync::{Semaphore, mpsc};
+use iroh::Endpoint;
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use self::{
     clip::ClipService,
     control::{Context, Server},
-    hub::Hub,
     pairing::Pairing,
     peers::PeerSet,
     store::MeshStore,
-    topics::Topics,
 };
 use crate::{
-    config::{Dirs, MachineKey, Membership, MeshState, Settings},
+    config::{Dirs, MachineKey, MeshState, Settings},
     net::{EndpointOptions, bind_endpoint, pair, proto},
 };
 
@@ -61,14 +58,8 @@ const MAX_PENDING_HANDSHAKES: usize = 32;
 /// than waiting out the transport timeout.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Memberships waiting to be merged. Merging is fast, so a full queue
-/// means a flood, and dropping is safe: the periodic pass heals it.
+/// Mesh states from peers waiting to be merged.
 const GOSSIP_QUEUE: usize = 16;
-
-/// How often the mesh state and the announcements are re-sent although
-/// nothing changed, so anything dropped under load is not lost until the
-/// next unrelated change.
-const ANTI_ENTROPY: Duration = Duration::from_mins(5);
 
 /// The protocols the daemon serves.
 ///
@@ -111,42 +102,24 @@ impl Daemon {
         let endpoint = bind_endpoint(&key, alpns(), options).await?;
         tracing::info!("daemon started as {}", key.endpoint_id());
 
-        let hub = Arc::new(Hub::new());
         let store = Arc::new(crate::files::Store::open(&dirs.files_dir())?);
-        let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
-        let spool = files::Spool {
-            store: store.clone(),
-            jobs: jobs_tx,
-        };
-        let topics = Arc::new(Topics {
-            clipboard: ClipService::open(
-                dirs,
-                key.endpoint_id(),
-                settings.clone(),
-                hub.clone(),
-                spool.clone(),
-            )?,
-        });
-        // Announced before anything can connect, so the hub has something
-        // to replay to the first peer that does. Without it a machine that
-        // starts with a history and copies nothing would look empty to
-        // everyone until the first anti-entropy pass.
-        topics.announce_all(&hub);
+        let (jobs, jobs_rx) = files::Jobs::new();
+        let clip = ClipService::open(dirs, key.endpoint_id(), settings.clone(), jobs)?;
 
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
+        let mesh = watch::Sender::new(state);
         let peers = Arc::new(PeerSet::new(
             endpoint.clone(),
-            key.endpoint_id(),
-            hub.clone(),
-            topics.clone(),
-            store.clone(),
+            clip.clone(),
+            mesh.subscribe(),
             gossip_tx,
+            store.clone(),
         ));
         let mesh = Arc::new(MeshStore::new(
             dirs.clone(),
-            state,
+            key.endpoint_id(),
+            mesh,
             peers.clone(),
-            hub.clone(),
         ));
         let pairing = Arc::new(Pairing::new(
             endpoint.clone(),
@@ -158,7 +131,7 @@ impl Daemon {
             endpoint: endpoint.clone(),
             started: SystemTime::now(),
             peers: peers.clone(),
-            topics: topics.clone(),
+            clip: clip.clone(),
             store: mesh.clone(),
             pairing: pairing.clone(),
         });
@@ -166,16 +139,15 @@ impl Daemon {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { server.serve(ctx).await });
         tasks.spawn(files::run(
-            topics.clipboard.clone(),
+            clip.clone(),
             peers.clone(),
+            store,
             settings,
-            spool,
             jobs_rx,
         ));
+        tasks.spawn(mesh.clone().merge_gossip(gossip_rx));
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
-        tasks.spawn(merge_loop(gossip_rx, key.endpoint_id(), mesh.clone()));
-        tasks.spawn(anti_entropy_loop(mesh, topics.clone(), hub));
-        tasks.spawn(clip::run(topics.clipboard.clone()));
+        tasks.spawn(clip::run(clip));
 
         Ok(Daemon { tasks, endpoint })
     }
@@ -252,40 +224,6 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
                 Err(_) => tracing::debug!("an incoming handshake timed out"),
             }
         });
-    }
-}
-
-/// Merges the mesh states peers send us.
-///
-/// A merge that changes something is saved and sent on, which is what
-/// carries membership to machines we are not talking to directly; a merge
-/// that changes nothing is silent, which is what stops the echo.
-async fn merge_loop(
-    mut gossip: mpsc::Receiver<(EndpointId, Membership)>,
-    local: EndpointId,
-    store: Arc<MeshStore>,
-) {
-    while let Some((peer, membership)) = gossip.recv().await {
-        let merged = store.update(|state| {
-            state.merge(&membership, &local);
-            Ok(())
-        });
-        if let Err(err) = merged {
-            tracing::warn!("cannot apply the mesh state from {peer}: {err:#}");
-        }
-    }
-}
-
-/// Re-sends the mesh state and the announcements on a timer.
-///
-/// Neither is acknowledged, and both are only sent when something changes,
-/// so one dropped under load would otherwise stay lost until the next
-/// unrelated change. This is what heals that.
-async fn anti_entropy_loop(store: Arc<MeshStore>, topics: Arc<Topics>, hub: Arc<Hub>) {
-    loop {
-        tokio::time::sleep(ANTI_ENTROPY).await;
-        store.republish();
-        topics.announce_all(&hub);
     }
 }
 

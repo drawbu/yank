@@ -4,8 +4,8 @@
 //! hermetic iroh endpoints (no relays, no DNS, nothing outside the
 //! machine) and driven through their control sockets exactly as the CLI
 //! drives them. What is being checked is the behaviour the design is for:
-//! that a machine which was away comes back to the right history, and that
-//! catching up sets the clipboard once rather than replaying it.
+//! whichever copy is the latest ends up on every machine, including one
+//! that was away when it was made.
 //!
 //! The compositor is turned off in every daemon's `config.toml`; what the
 //! clipboard state machine does with a compositor is covered by the unit
@@ -18,11 +18,13 @@ use std::{
 
 use tempfile::TempDir;
 use yank::{
+    cli,
     config::Dirs,
     daemon::{
         Daemon,
-        control::{CLIENT_TIMEOUT, Client, FileInfo, HistoryEntry, Request, Response},
+        control::{Request, Response},
     },
+    files::FileRef,
     net::EndpointOptions,
 };
 
@@ -32,7 +34,7 @@ struct Machine {
     dirs: Dirs,
     daemon: Option<Daemon>,
     /// Kept so the directory outlives the machine, restarts included.
-    _home: TempDir,
+    home: TempDir,
     options: EndpointOptions,
 }
 
@@ -40,7 +42,8 @@ impl Machine {
     async fn start(lookup: &iroh::address_lookup::MemoryLookup) -> eyre::Result<Self> {
         let home = tempfile::tempdir()?;
         let dirs = Dirs::new(Some(home.path().to_owned()))?;
-        write_settings(home.path())?;
+        // Keeps the tests off the compositor of the machine running them.
+        std::fs::write(home.path().join("config.toml"), "clipboard = false\n")?;
 
         let options = EndpointOptions::LocalTest {
             lookup: lookup.clone(),
@@ -50,7 +53,7 @@ impl Machine {
         Ok(Machine {
             dirs,
             daemon: Some(daemon),
-            _home: home,
+            home,
             options,
         })
     }
@@ -69,16 +72,7 @@ impl Machine {
     }
 
     async fn ask(&self, request: &Request) -> eyre::Result<Response> {
-        self.ask_within(request, CLIENT_TIMEOUT).await
-    }
-
-    /// The same, for a request the daemon answers only once something has
-    /// happened.
-    async fn ask_within(&self, request: &Request, within: Duration) -> eyre::Result<Response> {
-        Client::connect_required(&self.dirs)
-            .await?
-            .request(request, within)
-            .await
+        cli::ask(&self.dirs, request).await
     }
 
     async fn copy(&self, text: &str) -> eyre::Result<()> {
@@ -86,74 +80,68 @@ impl Machine {
             mime: "text/plain".to_owned(),
             bytes: text.as_bytes().to_vec(),
             secret: false,
-            ttl_secs: None,
+            ttl: None,
         })
         .await?;
 
         Ok(())
     }
 
-    async fn history(&self) -> eyre::Result<Vec<HistoryEntry>> {
-        match self.ask(&Request::History { limit: None }).await? {
-            Response::History(entries) => Ok(entries),
-            other => eyre::bail!("unexpected answer: {other:?}"),
-        }
-    }
-
-    async fn copy_files(&self, paths: &[PathBuf]) -> eyre::Result<String> {
+    async fn copy_files(&self, paths: &[PathBuf]) -> eyre::Result<()> {
         let paths = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
+        self.ask(&Request::CopyFiles { paths, ttl: None }).await?;
 
-        match self
-            .ask(&Request::CopyFiles {
-                paths,
-                ttl_secs: None,
-            })
-            .await?
-        {
-            Response::Wrote { label } => Ok(label),
+        Ok(())
+    }
+
+    /// Where the clipboard's files are on this machine, once a clip naming
+    /// some arrived. Asking is what makes the daemon go and get them, and
+    /// the answer is what waits.
+    async fn files(&self) -> eyre::Result<(PathBuf, Vec<FileRef>)> {
+        eventually("a clip naming files to arrive", || async {
+            match self.ask(&Request::Status).await? {
+                Response::Status(status) => {
+                    Ok(status.clipboard.current.is_some_and(|clip| clip.files > 0))
+                }
+                _ => Ok(false),
+            }
+        })
+        .await;
+
+        match self.ask(&Request::Files).await? {
+            Response::Files {
+                tree: Some(tree),
+                files,
+            } => Ok((PathBuf::from(tree), files)),
             other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }
 
-    /// Where the files of an entry are on this machine. Asking is what
-    /// makes the daemon go and get them, and the answer is what waits.
-    async fn files(&self, entry: Option<&str>) -> eyre::Result<(Option<PathBuf>, Vec<FileInfo>)> {
-        match self
-            .ask_within(
-                &Request::Files {
-                    entry: entry.map(str::to_owned),
-                },
-                SETTLE,
-            )
-            .await?
-        {
-            Response::Files { tree, files, .. } => Ok((tree.map(PathBuf::from), files)),
+    /// The preview of what the clipboard holds, as `yank status` shows it.
+    async fn current(&self) -> eyre::Result<Option<String>> {
+        match self.ask(&Request::Status).await? {
+            Response::Status(status) => Ok(status.clipboard.current.map(|clip| clip.preview)),
             other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }
 
-    async fn selection(&self) -> eyre::Result<Option<String>> {
-        Ok(self
-            .history()
-            .await?
-            .into_iter()
-            .find(|entry| entry.selected)
-            .map(|entry| entry.preview))
+    async fn paste(&self) -> eyre::Result<Vec<u8>> {
+        match self.ask(&Request::Paste { mime: None }).await? {
+            Response::Contents { bytes, .. } => Ok(bytes),
+            other => eyre::bail!("unexpected answer: {other:?}"),
+        }
     }
-}
 
-/// Writes a `config.toml` that keeps the tests off the machine running
-/// them: no compositor, and a small history so the caps are exercised.
-fn write_settings(home: &Path) -> eyre::Result<()> {
-    std::fs::write(
-        home.join("config.toml"),
-        "clipboard = false\nhistory-limit = 10\n",
-    )?;
-
-    Ok(())
+    /// Waits until the clipboard previews as `expected`.
+    async fn holds(&self, expected: Option<&str>) {
+        eventually(&format!("the clipboard to hold {expected:?}"), || async {
+            Ok(self.current().await?.as_deref() == expected)
+        })
+        .await;
+    }
 }
 
 /// Pairs two machines through their control sockets, ticket and all.
@@ -175,7 +163,7 @@ async fn pair(host: &Machine, joiner: &Machine) -> eyre::Result<()> {
         })
         .await?
     {
-        Response::Paired { .. } => Ok(()),
+        Response::Paired(_) => Ok(()),
         other => eyre::bail!("unexpected answer: {other:?}"),
     }
 }
@@ -185,7 +173,7 @@ async fn pair(host: &Machine, joiner: &Machine) -> eyre::Result<()> {
 async fn eventually<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = eyre::Result<bool>>,
+    Fut: Future<Output = eyre::Result<bool>>,
 {
     let deadline = std::time::Instant::now() + SETTLE;
     loop {
@@ -209,122 +197,50 @@ async fn mesh() -> eyre::Result<(Machine, Machine)> {
     Ok((first, second))
 }
 
+/// Every file under `dir`, read whole.
+fn every_file(dir: &Path) -> Vec<Vec<u8>> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn what_one_machine_copies_the_other_can_paste() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     first.copy("from the first").await?;
-    eventually("the entry to arrive", || async {
-        Ok(second.selection().await? == Some("from the first".to_owned()))
-    })
-    .await;
+    second.holds(Some("from the first")).await;
+    assert_eq!(second.paste().await?, b"from the first");
 
     // And back the other way, on the same connection.
     second.copy("from the second").await?;
-    eventually("the answer to arrive", || async {
-        Ok(first.selection().await? == Some("from the second".to_owned()))
-    })
-    .await;
+    first.holds(Some("from the second")).await;
 
     Ok(())
 }
 
+/// Two machines that copied while apart settle on the later copy, the one
+/// holding the older reconnecting last.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_machine_that_was_away_catches_up_in_order() -> eyre::Result<()> {
-    let (first, mut second) = mesh().await?;
+async fn the_later_copy_wins_after_a_split() -> eyre::Result<()> {
+    let (mut first, mut second) = mesh().await?;
+
     second.stop().await;
-
-    for text in ["one", "two", "three"] {
-        first.copy(text).await?;
-    }
-    second.restart().await?;
-
-    eventually("the backlog to arrive", || async {
-        Ok(second.history().await?.len() == 3)
-    })
-    .await;
-
-    let previews: Vec<String> = second
-        .history()
-        .await?
-        .into_iter()
-        .map(|entry| entry.preview)
-        .collect();
-    assert_eq!(previews, ["three", "two", "one"]);
-    // Only the newest is the selection: catching up must not walk the
-    // clipboard through everything that was missed.
-    assert_eq!(second.selection().await?, Some("three".to_owned()));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_local_copy_survives_catching_up() -> eyre::Result<()> {
-    let (first, mut second) = mesh().await?;
-    second.stop().await;
-
-    first.copy("copied elsewhere while away").await?;
-    // Far enough apart that the clock cannot call them simultaneous.
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    first.copy("older, made while apart").await?;
+    first.stop().await;
 
     second.restart().await?;
-    second.copy("copied here just now").await?;
+    second.copy("newer, made while apart").await?;
+    first.restart().await?;
 
-    eventually("the backlog to arrive", || async {
-        Ok(second.history().await?.len() == 2)
-    })
-    .await;
-    // The older entry joins the history without taking the clipboard.
+    first.holds(Some("newer, made while apart")).await;
     assert_eq!(
-        second.selection().await?,
-        Some("copied here just now".to_owned()),
+        second.current().await?.as_deref(),
+        Some("newer, made while apart"),
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn removing_an_entry_removes_it_on_both() -> eyre::Result<()> {
-    let (first, second) = mesh().await?;
-
-    first.copy("a mistake").await?;
-    eventually("the entry to arrive", || async {
-        Ok(second.history().await?.len() == 1)
-    })
-    .await;
-
-    let label = second.history().await?[0].label.clone();
-    second.ask(&Request::Forget { entry: label }).await?;
-
-    eventually("the removal to arrive", || async {
-        Ok(first.history().await?.is_empty())
-    })
-    .await;
-    assert!(second.history().await?.is_empty());
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn clearing_reaches_a_machine_that_was_away() -> eyre::Result<()> {
-    let (first, mut second) = mesh().await?;
-
-    first.copy("something").await?;
-    eventually("the entry to arrive", || async {
-        Ok(second.selection().await?.is_some())
-    })
-    .await;
-
-    second.stop().await;
-    first.ask(&Request::Clear { history: false }).await?;
-    second.restart().await?;
-
-    eventually("the clear to arrive", || async {
-        Ok(second.selection().await?.is_none())
-    })
-    .await;
-    // The clipboard is empty, the history is not.
-    assert_eq!(second.history().await?.len(), 1);
 
     Ok(())
 }
@@ -338,95 +254,60 @@ async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> eyre::Result<(
             mime: "text/plain".to_owned(),
             bytes: b"hunter2".to_vec(),
             secret: true,
-            ttl_secs: Some(600),
+            ttl: Some(Duration::from_secs(3)),
         })
         .await?;
 
-    eventually("the secret to arrive", || async {
-        Ok(second.history().await?.len() == 1)
-    })
-    .await;
+    second.holds(Some("<secret>")).await;
+    assert_eq!(second.paste().await?, b"hunter2");
 
-    let entry = second.history().await?.remove(0);
-    assert!(entry.secret);
-    assert_eq!(entry.preview, "<secret>");
-    assert!(entry.expires_in_secs.is_some());
-
-    // It is pastable on the other machine, which is the point of sharing
-    // it, and nowhere in its history directory, which is the point of
-    // marking it.
-    let Response::Contents { bytes, .. } = second
-        .ask(&Request::Paste {
-            entry: None,
-            mime: None,
-        })
-        .await?
-    else {
-        eyre::bail!("expected the contents");
-    };
-    assert_eq!(bytes, b"hunter2");
-
-    let history = std::fs::read_dir(second.dirs.history_dir())?;
-    for file in history {
-        let bytes = std::fs::read(file?.path())?;
-        assert!(
-            !bytes.windows(7).any(|window| window == b"hunter2"),
-            "a secret was written to disk",
-        );
+    for machine in [&first, &second] {
+        for bytes in every_file(machine.home.path()) {
+            assert!(
+                !bytes.windows(7).any(|window| window == b"hunter2"),
+                "a secret was written to disk",
+            );
+        }
     }
+
+    // Gone everywhere once its lifetime is up, network or not.
+    first.holds(None).await;
+    second.holds(None).await;
 
     Ok(())
 }
 
-/// A machine that restarts has to tell its peers what it holds without
-/// waiting for someone to copy something. Nothing else would make a peer
-/// ask for a history written before either of them was last started.
+/// A machine that was away gets the latest clip from one that restarted
+/// since, which has to announce what it holds without waiting for a new
+/// copy, and must not bring an older one back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_restarted_machine_announces_what_it_already_had() -> eyre::Result<()> {
+async fn a_clear_reaches_a_machine_that_was_away_across_restarts() -> eyre::Result<()> {
     let (mut first, mut second) = mesh().await?;
-    second.stop().await;
 
-    first.copy("written before either restarted").await?;
+    first.copy("something").await?;
+    second.holds(Some("something")).await;
+
+    second.stop().await;
+    first.ask(&Request::Clear).await?;
     first.restart().await?;
     second.restart().await?;
 
-    eventually("the history to arrive", || async {
-        Ok(second.history().await?.len() == 1)
-    })
-    .await;
-    assert_eq!(
-        second.selection().await?,
-        Some("written before either restarted".to_owned()),
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_restarted_machine_keeps_its_history() -> eyre::Result<()> {
-    let lookup = iroh::address_lookup::MemoryLookup::default();
-    let mut machine = Machine::start(&lookup).await?;
-
-    machine.copy("written before the restart").await?;
-    machine.restart().await?;
-
-    let history = machine.history().await?;
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].preview, "written before the restart");
+    second.holds(None).await;
+    assert_eq!(first.current().await?, None);
 
     Ok(())
 }
 
 /// The whole point of carrying files rather than paths: what the second
-/// machine gets is the bytes, under the names they had, and not a path
-/// into a filesystem it does not have.
+/// machine gets is the bytes, as they were copied, under the names they
+/// had, and not a path into a filesystem it does not have.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;
     std::fs::create_dir_all(source.path().join("folder/deep"))?;
-    std::fs::write(source.path().join("folder/one.txt"), b"the first file")?;
+    std::fs::write(source.path().join("folder/one.txt"), b"as it was")?;
     std::fs::write(
         source.path().join("folder/deep/two.bin"),
         vec![7u8; 300_000],
@@ -434,29 +315,20 @@ async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> eyre::Result<(
     let loose = source.path().join("loose.txt");
     std::fs::write(&loose, b"on its own")?;
 
-    let label = first
+    first
         .copy_files(&[source.path().join("folder"), loose])
         .await?;
+    // The source is not read again at paste time.
+    std::fs::write(source.path().join("folder/one.txt"), b"edited afterwards")?;
 
-    eventually("the entry to arrive", || async {
-        Ok(second.history().await?.iter().any(|entry| entry.files == 3))
-    })
-    .await;
-
-    // Asking is what sets the fetch going, and the answer is what waits
-    // for it: the daemon holds the request until the files are laid out.
-    let (tree, files) = second.files(Some(&label)).await?;
-    let tree = tree.expect("the answer waits for them");
+    let (tree, files) = second.files().await?;
 
     let names: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
     assert_eq!(
         names,
         vec!["folder/deep/two.bin", "folder/one.txt", "loose.txt"],
     );
-    assert_eq!(
-        std::fs::read(tree.join("folder/one.txt"))?,
-        b"the first file",
-    );
+    assert_eq!(std::fs::read(tree.join("folder/one.txt"))?, b"as it was");
     assert_eq!(
         std::fs::read(tree.join("folder/deep/two.bin"))?,
         vec![7u8; 300_000],
@@ -466,57 +338,105 @@ async fn a_file_copied_on_one_machine_is_a_file_on_the_other() -> eyre::Result<(
     Ok(())
 }
 
-/// The source is not read again at paste time, so what arrives is what was
-/// copied, whatever happened to the original in between.
+/// A folder of many small files, some sharing their contents, arrives
+/// whole, its contents spooled once each.
 #[tokio::test(flavor = "multi_thread")]
-async fn what_arrives_is_what_was_copied_and_not_what_the_file_became() -> eyre::Result<()> {
+async fn a_folder_of_many_files_arrives_whole() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;
-    let path = source.path().join("notes.txt");
-    std::fs::write(&path, b"as it was")?;
+    let folder = source.path().join("many");
+    std::fs::create_dir(&folder)?;
+    for i in 0..1000 {
+        std::fs::write(
+            folder.join(format!("{i:04}.txt")),
+            format!("file {}", i % 10),
+        )?;
+    }
+    first.copy_files(&[folder]).await?;
 
-    let label = first.copy_files(std::slice::from_ref(&path)).await?;
-    std::fs::write(&path, b"edited afterwards")?;
-
-    eventually("the entry to arrive", || async {
-        Ok(second.history().await?.iter().any(|it| it.label == label))
-    })
-    .await;
-
-    let (tree, _) = second.files(Some(&label)).await?;
+    let (tree, files) = second.files().await?;
+    assert_eq!(files.len(), 1000);
+    assert_eq!(std::fs::read(tree.join("many/0123.txt"))?, b"file 3");
     assert_eq!(
-        std::fs::read(tree.unwrap().join("notes.txt"))?,
-        b"as it was",
+        std::fs::read_dir(second.dirs.files_dir().join("blobs"))?.count(),
+        10
     );
 
     Ok(())
 }
 
-/// An entry that leaves the history takes its files with it: they are
-/// clipboard contents, and they sit on the disk in the clear.
+/// A machine missing one of the files still sends the others after it, a
+/// transfer cut short carries on where it stopped, and the missing file
+/// arrives once a machine has it again.
 #[tokio::test(flavor = "multi_thread")]
-async fn dropping_an_entry_drops_its_files() -> eyre::Result<()> {
+async fn a_fetch_resumes_and_skips_what_a_peer_lacks() -> eyre::Result<()> {
+    let (first, mut second) = mesh().await?;
+    second.stop().await;
+
+    let source = tempfile::tempdir()?;
+    let contents: [&[u8]; 3] = [b"first file", b"second file", &[9u8; 200_000]];
+    let paths: Vec<PathBuf> = contents
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let path = source.path().join(format!("{i}.bin"));
+            std::fs::write(&path, bytes)?;
+            Ok(path)
+        })
+        .collect::<std::io::Result<_>>()?;
+    first.copy_files(&paths).await?;
+
+    let blob = |machine: &Machine, bytes: &[u8]| {
+        let name = yank::files::Hash::of(bytes).file_name();
+        machine.dirs.files_dir().join("blobs").join(name)
+    };
+    // The first machine lost the middle one, and the second already holds
+    // the start of the last one.
+    let held = blob(&first, contents[1]);
+    let kept = std::fs::read(&held)?;
+    std::fs::remove_file(&held)?;
+    std::fs::create_dir_all(second.dirs.files_dir().join("blobs"))?;
+    let partial = blob(&second, contents[2]).with_extension("part");
+    std::fs::write(&partial, &contents[2][..50_000])?;
+
+    second.restart().await?;
+    eventually("the files the peer has to arrive", || async {
+        Ok(blob(&second, contents[0]).exists() && blob(&second, contents[2]).exists())
+    })
+    .await;
+
+    std::fs::write(&held, kept)?;
+    let (tree, _) = second.files().await?;
+    for (i, bytes) in contents.iter().enumerate() {
+        assert_eq!(std::fs::read(tree.join(format!("{i}.bin")))?, *bytes);
+    }
+
+    Ok(())
+}
+
+/// A copy that is replaced takes its files with it: they are clipboard
+/// contents, and they sit on the disk in the clear.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_file_copy_drops_its_files() -> eyre::Result<()> {
     let (first, second) = mesh().await?;
 
     let source = tempfile::tempdir()?;
-    let path = source.path().join("secret.txt");
+    let path = source.path().join("private.txt");
     std::fs::write(&path, b"nothing to see")?;
-    let label = first.copy_files(std::slice::from_ref(&path)).await?;
+    first.copy_files(std::slice::from_ref(&path)).await?;
+    let (tree, _) = second.files().await?;
 
-    eventually("the entry to arrive", || async {
-        Ok(second.history().await?.iter().any(|it| it.label == label))
-    })
-    .await;
-    let (tree, _) = second.files(Some(&label)).await?;
-    let tree = tree.expect("the answer waits for them");
-
-    first.ask(&Request::Forget { entry: label }).await?;
+    first.copy("something else").await?;
     eventually("the files to go", || async { Ok(!tree.exists()) }).await;
 
-    let spool = second.dirs.files_dir().join("blobs");
-    let left = std::fs::read_dir(spool)?.count();
-    assert_eq!(left, 0, "the content of a forgotten entry stays on disk");
+    for machine in [&first, &second] {
+        let spool = machine.dirs.files_dir().join("blobs");
+        eventually("the spool to empty", || async {
+            Ok(std::fs::read_dir(&spool)?.count() == 0)
+        })
+        .await;
+    }
 
     Ok(())
 }

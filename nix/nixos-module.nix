@@ -3,9 +3,6 @@
 # It installs the package and the unit; the configuration file lives in
 # each user's home, so `config.toml` is theirs to write. Use the Home
 # Manager module instead when you want it managed declaratively.
-#
-# Do not also run `yank service install`: that writes a second unit into
-# the user's own systemd directory, which shadows this one.
 
 self:
 {

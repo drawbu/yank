@@ -1,6 +1,6 @@
 [package]
 name = "yank"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A peer-to-peer clipboard daemon"
 license = "WTFPL"
@@ -21,7 +21,7 @@ percent-encoding = "2.3"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 rand = "0.10"
 rustix = { version = "1.1", features = ["event", "pipe", "system"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 subtle = { version = "2.6", default-features = false }
 thiserror = "2"

@@ -1,4 +1,4 @@
-//! The clipboard commands: copying, pasting, and the shared history.
+//! The clipboard commands.
 
 use std::{
     fs,
@@ -10,13 +10,15 @@ use std::{
 use clap::Args;
 use eyre::WrapErr as _;
 
-use super::{Situation, parse_duration, ui};
+use super::{
+    Situation,
+    client::{request, unexpected},
+    parse_duration, ui,
+};
 use crate::{
     clip::mime::PLAIN_TEXT,
     config::Dirs,
-    daemon::control::{
-        CLIENT_TIMEOUT, COPY_FILES_TIMEOUT, FILES_TIMEOUT, HistoryEntry, Request, Response, request,
-    },
+    daemon::control::{Request, Response},
 };
 
 /// Copy something to every machine
@@ -38,9 +40,9 @@ pub struct CopyArgs {
 
     /// Treat it as a password
     ///
-    /// It is shared, but never written to disk on any machine, never shown
-    /// in the history, and given a lifetime (`secret-ttl` in config.toml)
-    /// unless `--ttl` says otherwise.
+    /// It is shared, but never written to disk on any machine, never shown,
+    /// and given a lifetime (`secret-ttl` in config.toml) unless `--ttl`
+    /// says otherwise.
     #[arg(long, short = 's')]
     secret: bool,
 
@@ -53,9 +55,8 @@ pub struct CopyArgs {
     /// The other machines get the file itself, not the path, and pasting
     /// it there writes it wherever it is pasted.
     ///
-    /// Not for a secret: sharing a file writes it to disk on every machine
-    /// that holds the entry, which is the one thing `--secret` promises
-    /// never happens.
+    /// Not for a secret: sharing a file writes it to disk on every machine,
+    /// which is the one thing `--secret` promises never happens.
     #[arg(
         long = "file",
         short = 'f',
@@ -65,15 +66,12 @@ pub struct CopyArgs {
     files: Vec<PathBuf>,
 }
 
-/// Write the files of an entry here
+/// Write the files on the clipboard here
 ///
 /// The daemon fetches them from whoever has them, which takes as long as
 /// the files are large.
 #[derive(Debug, Args)]
 pub struct GetArgs {
-    /// Entry to write, from `yank list`; the current one by default
-    entry: Option<String>,
-
     /// Where to write them
     #[arg(long, short = 'C', value_name = "DIR", default_value = ".")]
     to: PathBuf,
@@ -82,144 +80,74 @@ pub struct GetArgs {
 /// Print what is on the clipboard
 #[derive(Debug, Args)]
 pub struct PasteArgs {
-    /// Entry to print, from `yank list`; the current one by default
-    entry: Option<String>,
-
-    /// Print the types the entry carries instead of the contents
+    /// Print the types the clipboard carries instead of the contents
     #[arg(long)]
     mime: bool,
 
-    /// Type to print it in, when the entry carries several
+    /// Type to print it in, when the clipboard carries several
     #[arg(long = "type", value_name = "MIME")]
     mime_type: Option<String>,
 }
 
-/// List the shared history, newest first
-#[derive(Debug, Args)]
-pub struct ListArgs {
-    /// How many entries to show
-    #[arg(long, short = 'n', value_name = "COUNT")]
-    limit: Option<usize>,
-
-    /// Print only the entry names, one per line, for scripts and pickers
-    #[arg(long)]
-    plain: bool,
-}
-
-/// Put an entry from the history back on the clipboard
-#[derive(Debug, Args)]
-pub struct PickArgs {
-    /// Entry to pick, from `yank list`
-    entry: String,
-}
-
-/// Remove an entry from every machine
-#[derive(Debug, Args)]
-pub struct RmArgs {
-    /// Entry to remove, from `yank list`
-    entry: String,
-}
-
-/// Empty the clipboard on every machine
-#[derive(Debug, Args)]
-pub struct ClearArgs {
-    /// Drop the whole shared history as well
-    #[arg(long)]
-    history: bool,
-}
-
 pub fn copy(args: CopyArgs, dirs: &Dirs) -> eyre::Result<()> {
-    if !args.files.is_empty() {
-        return copy_files(&args, dirs);
-    }
-
-    let bytes = if args.text.is_empty() {
-        let mut bytes = Vec::new();
-        std::io::stdin().read_to_end(&mut bytes)?;
-        bytes
-    } else {
-        args.text.join(" ").into_bytes()
-    };
-
-    let response = request(
-        dirs,
-        &Request::Copy {
+    let copy = if args.files.is_empty() {
+        let bytes = if args.text.is_empty() {
+            let mut bytes = Vec::new();
+            std::io::stdin().read_to_end(&mut bytes)?;
+            bytes
+        } else {
+            args.text.join(" ").into_bytes()
+        };
+        Request::Copy {
             mime: args.mime,
             bytes,
             secret: args.secret,
-            ttl_secs: args.ttl.map(|ttl| ttl.as_secs()),
-        },
-        CLIENT_TIMEOUT,
-    )?;
-
-    match response {
-        Response::Wrote { label } => {
-            anstream::println!("{}", ui::good(format_args!("Copied as {label}")));
-            Ok(())
+            ttl: args.ttl,
         }
-        other => unexpected(&other),
-    }
-}
-
-/// Shares files themselves rather than the text of their paths.
-fn copy_files(args: &CopyArgs, dirs: &Dirs) -> eyre::Result<()> {
-    if !args.text.is_empty() {
-        eyre::bail!("copy either text or files, not both");
-    }
-
-    let paths = args
-        .files
-        .iter()
-        .map(|path| {
-            // The other machines are told where this came from as well as
-            // what it is, and a relative path means nothing there.
-            let path = path.canonicalize()?;
-            Ok(path.to_string_lossy().into_owned())
-        })
-        .collect::<std::io::Result<Vec<String>>>()?;
-
-    let response = request(
-        dirs,
-        &Request::CopyFiles {
+    } else {
+        // Files themselves rather than the text of their paths.
+        eyre::ensure!(args.text.is_empty(), "copy either text or files, not both");
+        let paths = args
+            .files
+            .iter()
+            .map(|path| {
+                // The other machines are told where this came from as well
+                // as what it is, and a relative path means nothing there.
+                let path = path.canonicalize()?;
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .collect::<std::io::Result<Vec<String>>>()?;
+        Request::CopyFiles {
             paths,
-            ttl_secs: args.ttl.map(|ttl| ttl.as_secs()),
-        },
-        // Spooling is a copy of every file, and the daemon answers once it
-        // is done: an entry never names content it cannot serve.
-        COPY_FILES_TIMEOUT,
-    )?;
+            ttl: args.ttl,
+        }
+    };
 
-    match response {
-        Response::Wrote { label } => {
-            anstream::println!("{}", ui::good(format_args!("Copied as {label}")));
+    match request(dirs, &copy)? {
+        Response::Done => {
+            anstream::println!("{}", ui::good("Copied"));
             Ok(())
         }
-        other => unexpected(&other),
+        other => Err(unexpected(&other)),
     }
 }
 
-/// Writes an entry's files here.
+/// Writes the clipboard's files here.
 ///
 /// The daemon answers once they are laid out on this machine, so what
 /// takes time is the transfer itself.
 pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(
-        dirs,
-        &Request::Files {
-            entry: args.entry.clone(),
-        },
-        FILES_TIMEOUT,
-    )?;
-    let Response::Files { label, tree, files } = response else {
-        return unexpected(&response);
+    let response = request(dirs, &Request::Files)?;
+    let Response::Files { tree, files } = response else {
+        return Err(unexpected(&response));
     };
     let Some(tree) = tree else {
-        return Err(Situation::FilesPending { label }.into());
+        return Err(Situation::FilesPending.into());
     };
     let tree = PathBuf::from(tree);
 
     // Checked before anything is written, so a collision halfway through
-    // does not leave half an entry behind.
+    // does not leave half a copy behind.
     for file in &files {
         let to = args.to.join(&file.path);
         eyre::ensure!(!to.exists(), "{} is already there", to.display());
@@ -238,7 +166,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
     anstream::println!(
         "{}",
         ui::good(format_args!(
-            "Wrote {} file(s) from {label} to {}",
+            "Wrote {} file(s) to {}",
             files.len(),
             args.to.display(),
         )),
@@ -251,10 +179,8 @@ pub fn paste(args: &PasteArgs, dirs: &Dirs) -> eyre::Result<()> {
     let response = request(
         dirs,
         &Request::Paste {
-            entry: args.entry.clone(),
             mime: args.mime_type.clone(),
         },
-        CLIENT_TIMEOUT,
     )?;
 
     match response {
@@ -281,124 +207,16 @@ pub fn paste(args: &PasteArgs, dirs: &Dirs) -> eyre::Result<()> {
 
             Ok(())
         }
-        other => unexpected(&other),
+        other => Err(unexpected(&other)),
     }
 }
 
-pub fn list(args: &ListArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(
-        dirs,
-        &Request::History { limit: args.limit },
-        CLIENT_TIMEOUT,
-    )?;
-    let Response::History(entries) = response else {
-        return unexpected(&response);
-    };
-
-    if entries.is_empty() {
-        anstream::println!("{}", ui::dim("The shared history is empty."));
-        return Ok(());
-    }
-    if args.plain {
-        for entry in &entries {
-            anstream::println!("{}", entry.label);
-        }
-        return Ok(());
-    }
-
-    let labels = ui::width(entries.iter().map(|entry| entry.label.as_str()));
-    let origins = ui::width(entries.iter().map(|entry| entry.origin.as_str()));
-    for entry in &entries {
-        anstream::println!(
-            "{} {:labels$} {:origins$} {} {}",
-            if entry.selected { "*" } else { " " },
-            ui::heading(&entry.label),
-            ui::dim(&entry.origin),
-            ui::dim(format_args!("{:>4}", ui::duration(entry.age_secs))),
-            preview(entry),
-        );
-    }
-
-    Ok(())
-}
-
-pub fn pick(args: PickArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(dirs, &Request::Pick { entry: args.entry }, CLIENT_TIMEOUT)?;
-
-    match response {
-        Response::Wrote { label } => {
-            anstream::println!("{}", ui::good(format_args!("Copied as {label}")));
-            Ok(())
-        }
-        other => unexpected(&other),
-    }
-}
-
-pub fn rm(args: RmArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(dirs, &Request::Forget { entry: args.entry }, CLIENT_TIMEOUT)?;
-
-    match response {
-        Response::Wrote { label } => {
-            anstream::println!("{}", ui::good(format_args!("Removed {label} everywhere")));
-            Ok(())
-        }
-        other => unexpected(&other),
-    }
-}
-
-pub fn clear(args: &ClearArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(
-        dirs,
-        &Request::Clear {
-            history: args.history,
-        },
-        CLIENT_TIMEOUT,
-    )?;
-
-    match response {
-        Response::Cleared if args.history => {
-            anstream::println!(
-                "{}",
-                ui::good("Cleared the clipboard and history everywhere")
-            );
-            Ok(())
-        }
-        Response::Cleared => {
+pub fn clear(dirs: &Dirs) -> eyre::Result<()> {
+    match request(dirs, &Request::Clear)? {
+        Response::Done => {
             anstream::println!("{}", ui::good("Cleared the clipboard everywhere"));
             Ok(())
         }
-        other => unexpected(&other),
+        other => Err(unexpected(&other)),
     }
-}
-
-/// One entry's contents, with its lifetime when it has one.
-fn preview(entry: &HistoryEntry) -> String {
-    let preview = if entry.secret {
-        ui::warn(&entry.preview).to_string()
-    } else if entry.files > 0 {
-        format!(
-            "{} {}",
-            entry.preview,
-            ui::dim(format_args!(
-                "({} file{}, {})",
-                entry.files,
-                if entry.files == 1 { "" } else { "s" },
-                bytesize::ByteSize::b(entry.size as u64),
-            )),
-        )
-    } else {
-        entry.preview.clone()
-    };
-
-    match entry.expires_in_secs {
-        Some(secs) => format!(
-            "{preview} {}",
-            ui::warn(format_args!("(gone in {})", ui::duration(secs))),
-        ),
-        None => preview,
-    }
-}
-
-fn unexpected(response: &Response) -> eyre::Result<()> {
-    eyre::bail!("unexpected answer from the daemon: {response:?}")
 }

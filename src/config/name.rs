@@ -11,17 +11,17 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Maximum length kept by [`sanitize_bounded`].
 const MAX_SANITIZED_LEN: usize = 256;
 
-/// Checks that a name is usable; `kind` names it in the error. Also applied
-/// to names arriving from remote machines.
-pub fn validate_name(kind: &str, name: &str) -> eyre::Result<()> {
-    eyre::ensure!(!name.is_empty(), "{kind} name cannot be empty");
+/// Checks that a machine name is usable. Also applied to names arriving
+/// from remote machines.
+pub fn validate_name(name: &str) -> eyre::Result<()> {
+    eyre::ensure!(!name.is_empty(), "machine name cannot be empty");
     eyre::ensure!(
         name.len() <= MAX_NAME_LEN,
-        "{kind} name is longer than {MAX_NAME_LEN} bytes",
+        "machine name is longer than {MAX_NAME_LEN} bytes",
     );
     eyre::ensure!(
         !name.chars().any(is_confusable),
-        "{kind} name contains control or invisible characters",
+        "machine name contains control or invisible characters",
     );
 
     Ok(())
@@ -78,9 +78,9 @@ mod tests {
 
     #[test]
     fn names_are_validated() {
-        assert!(validate_name("machine", "laptop").is_ok());
-        assert!(validate_name("machine", "").is_err());
-        assert!(validate_name("machine", "a\u{202E}b").is_err());
-        assert!(validate_name("machine", &"x".repeat(MAX_NAME_LEN + 1)).is_err());
+        assert!(validate_name("laptop").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("a\u{202E}b").is_err());
+        assert!(validate_name(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
     }
 }

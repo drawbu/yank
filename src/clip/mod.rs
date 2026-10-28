@@ -1,12 +1,20 @@
-//! Clipboard state, event payloads, mime policy, and Wayland integration.
+//! The clipboard: what the mesh shares, the state machine deciding what
+//! this machine's clipboard holds, and the platform it talks to.
 
 pub mod backend;
-pub mod event;
+mod copy;
 pub mod mime;
-pub mod state;
+mod stamp;
+mod state;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
-pub use backend::{Backend, Captured, Policy, Serve};
-pub use event::{Copy, Event, Rep, Selection};
-pub use state::{Clipboard, Effect, Item, Pause, Switch};
+pub use backend::{Captured, Policy, Serve};
+pub use copy::{Clip, Copy, Rep, Selection};
+pub use stamp::Stamp;
+pub use state::{Clipboard, Effect, Pause, Saved, Switch};
+
+/// Hard ceiling on one selection, every representation together, enforced
+/// before anything is stored. The user-facing cap in `config.toml` sits
+/// under it.
+pub const MAX_SIZE: u32 = 4 * 1024 * 1024;

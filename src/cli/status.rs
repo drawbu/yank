@@ -1,24 +1,18 @@
 //! `yank status`: what the daemon is doing.
 
-use clap::Args;
-
-use super::{pause, ui};
+use super::{
+    client::{request, unexpected},
+    pause, ui,
+};
 use crate::{
     config::Dirs,
-    daemon::control::{
-        CLIENT_TIMEOUT, ConnectionStatus, HistoryEntry, PeerStatus, Request, Response, Route,
-        Status, request,
-    },
+    daemon::control::{ClipInfo, ConnectionStatus, PeerInfo, Request, Response, Route, Status},
 };
 
-/// Show the machines, the clipboard and the daemon
-#[derive(Debug, Args)]
-pub struct StatusArgs {}
-
-pub fn run(_args: &StatusArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let response = request(dirs, &Request::Status, CLIENT_TIMEOUT)?;
+pub fn run(dirs: &Dirs) -> eyre::Result<()> {
+    let response = request(dirs, &Request::Status)?;
     let Response::Status(status) = response else {
-        eyre::bail!("unexpected answer from the daemon: {response:?}");
+        return Err(unexpected(&response));
     };
 
     print(&status);
@@ -46,14 +40,10 @@ fn print(status: &Status) {
     anstream::println!("  {}", pause::describe(status.clipboard.pause));
 
     anstream::println!("\n{}", ui::heading("Clipboard"));
-    match &status.clipboard.selection {
-        Some(entry) => anstream::println!("  {}", selection(entry)),
+    match &status.clipboard.current {
+        Some(clip) => anstream::println!("  {}", current(clip)),
         None => anstream::println!("  {}", ui::dim("empty")),
     }
-    anstream::println!(
-        "  {}",
-        ui::dim(format_args!("{} entries shared", status.clipboard.entries)),
-    );
 
     anstream::println!("\n{}", ui::heading("Machines"));
     if status.peers.is_empty() {
@@ -70,14 +60,24 @@ fn print(status: &Status) {
     }
 }
 
-/// The entry currently on the clipboard.
-fn selection(entry: &HistoryEntry) -> String {
-    let preview = if entry.secret {
-        ui::warn(&entry.preview).to_string()
+/// What the clipboard holds.
+fn current(clip: &ClipInfo) -> String {
+    let preview = if clip.secret {
+        ui::warn(&clip.preview).to_string()
+    } else if clip.files > 0 {
+        format!(
+            "{} {}",
+            clip.preview,
+            ui::dim(format_args!(
+                "({} file{})",
+                clip.files,
+                if clip.files == 1 { "" } else { "s" }
+            )),
+        )
     } else {
-        entry.preview.clone()
+        clip.preview.clone()
     };
-    let expiry = match entry.expires_in_secs {
+    let expiry = match clip.expires_in_secs {
         Some(secs) => format!(
             " {}",
             ui::warn(format_args!("(gone in {})", ui::duration(secs)))
@@ -89,14 +89,14 @@ fn selection(entry: &HistoryEntry) -> String {
         "{preview}{expiry} {}",
         ui::dim(format_args!(
             "— {}, {} ago",
-            entry.origin,
-            ui::duration(entry.age_secs),
+            clip.origin,
+            ui::duration(clip.age_secs),
         )),
     )
 }
 
 /// One machine's connection, in a few words.
-fn connection(peer: &PeerStatus) -> String {
+fn connection(peer: &PeerInfo) -> String {
     match &peer.connection {
         ConnectionStatus::Connecting => ui::warn("connecting").to_string(),
         ConnectionStatus::Backoff { retry_in_secs } => ui::bad(format_args!(

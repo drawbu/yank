@@ -38,7 +38,6 @@ in
         {
           # A machine with no graphical session.
           clipboard = false;
-          history-limit = 200;
           secret-ttl = "45s";
         }
       '';
@@ -64,13 +63,6 @@ in
 
     xdg.configFile."yank/config.toml" = lib.mkIf manageSettings {
       source = settingsFile;
-    };
-
-    # Recorded so `yank service install` refuses to replace a unit it does
-    # not own.
-    xdg.configFile."yank/service.toml".source = tomlFormat.generate "yank-service.toml" {
-      installer = "home-manager";
-      label = "yank";
     };
 
     systemd.user.services.yank = {

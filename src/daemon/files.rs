@@ -5,45 +5,35 @@
 //! everything here is slow in a way the clipboard must not be:
 //!
 //! ```text
-//!   copy   uri-list ─► walk ─► spool ─► manifest ─► the entry, shared
+//!   copy   uri-list ─► walk ─► spool ─► manifest ─► the clip, shared
 //!   paste  Effect::Fetch ─► pull the hashes ─► lay out ─► re-offer
-//!   always entries dropped ─► sweep what nothing names any more
+//!   always clip replaced ─► sweep what it no longer names
 //! ```
 //!
-//! Copying is what holds the entry up: the files are spooled before it is
-//! written, so an entry never names content this machine cannot serve.
-//! Pasting is not: the entry reaches the clipboard as the text of its
-//! paths right away, and becomes a file reference when the bytes land.
+//! Copying is what holds the clip up: the files are spooled before it is
+//! made, so a clip never names content this machine cannot serve. Pasting
+//! is not: the clip reaches the clipboard as the text of its paths right
+//! away, and becomes a file reference when the bytes land.
 
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 
 use eyre::WrapErr as _;
-use iroh::{EndpointId, endpoint::Connection};
+use iroh::endpoint::{Connection, RecvStream};
 use tokio::{
-    sync::{Semaphore, mpsc},
-    task::spawn_blocking,
+    sync::{mpsc, oneshot},
+    task::{JoinHandle, spawn_blocking},
 };
 
 use super::{backoff::Backoff, clip::ClipService, peers::PeerSet};
 use crate::{
-    clip::Captured,
+    clip::{Captured, Stamp},
     config::Settings,
-    files::{self, FileRef, Store},
-    log::EntryId,
+    files::{self, FileRef, Incoming, Store},
     net::{
         proto::{self, Ask, ContentReply, ContentRequest},
         wire::{read_message, write_message},
     },
 };
-
-/// How many files one selection may name. A folder is walked, and a deep
-/// one is a manifest the log cannot carry.
-const MAX_FILES: usize = 4096;
 
 /// Budget for one chunk of a transfer. A peer that stops sending mid-file
 /// without dropping the connection would otherwise hold the queue.
@@ -54,44 +44,57 @@ const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_QUEUE: usize = 4;
 
 /// Delays between attempts at a fetch. A peer that has the content may be
-/// asleep, and the clipboard entry outlives its absence.
+/// asleep.
 const RETRY_MIN: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_mins(2);
 
-/// How many times a fetch is attempted before the entry stays text.
+/// How many times a fetch is attempted before the clip stays text.
 const RETRIES: usize = 6;
 
-/// What the clipboard asks the spool for.
+/// What the clipboard asks the file service for.
+///
+/// Jobs that touch the spool run one at a time, in order, so a sweep never
+/// sees a file taken in but not yet named by the clip.
 #[derive(Debug)]
 pub enum Job {
-    /// Record a non-file selection in compositor order.
-    Record(Captured),
-    /// Take the files this selection names into the spool, then record
-    /// it. The entry is not written until the content is here to back it.
-    Snapshot {
+    /// Take the files a selection names into the spool, then record it,
+    /// in compositor order. The clip is not made until the content is here
+    /// to back it.
+    Record {
+        /// The clip when it was copied; see [`ClipService::record`].
+        base: Option<Stamp>,
         captured: Box<Captured>,
-        /// What it names, read off it once by the caller that decided this
-        /// was a file selection at all.
+        /// The files it names, empty when it names none.
         paths: Vec<PathBuf>,
     },
-    /// Bring this entry's files onto this machine.
-    Fetch(EntryId),
-    /// Drop what no entry names any more.
+    /// Take files into the spool and copy them, from `yank copy`.
+    Copy {
+        paths: Vec<PathBuf>,
+        ttl: Option<Duration>,
+        done: oneshot::Sender<eyre::Result<()>>,
+    },
+    /// Bring the files of the clip with this stamp onto this machine.
+    Fetch(Stamp),
+    /// Drop what the clip does not name.
     Sweep,
 }
 
-/// How the clipboard reaches the spool.
+/// How the clipboard reaches the file service.
 #[derive(Clone, Debug)]
-pub struct Spool {
-    pub store: Arc<Store>,
-    pub jobs: mpsc::UnboundedSender<Job>,
-}
+pub struct Jobs(mpsc::UnboundedSender<Job>);
 
-impl Spool {
+impl Jobs {
+    /// The queue, and its end for [`run`].
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<Job>) {
+        let (jobs, queue) = mpsc::unbounded_channel();
+
+        (Jobs(jobs), queue)
+    }
+
     /// Queues a job, dropping it if the service is gone: the daemon is on
     /// its way down, and files are not worth a panic.
     pub fn send(&self, job: Job) {
-        if self.jobs.send(job).is_err() {
+        if self.0.send(job).is_err() {
             tracing::debug!("the file service is gone; dropping a job");
         }
     }
@@ -101,293 +104,311 @@ impl Spool {
 pub async fn run(
     clip: Arc<ClipService>,
     peers: Arc<PeerSet>,
+    store: Arc<Store>,
     settings: Arc<Settings>,
-    spool: Spool,
     mut jobs: mpsc::UnboundedReceiver<Job>,
 ) {
-    sweep(&clip, &spool.store);
+    sweep(&clip, &store).await;
 
-    // One fetch at a time: they are whole files, and a machine catching up
-    // on a history of them should not open one connection per entry. The
-    // permit is taken in the task rather than here, so a transfer holds up
-    // the next transfer and nothing else.
-    let fetching = Arc::new(Semaphore::new(1));
-    // The clipboard and a caller waiting on the files both ask, and
-    // running the fetch twice would have the second lay the tree out again
-    // under the first.
-    let asked: Arc<Mutex<BTreeSet<EntryId>>> = Arc::default();
+    // One fetch at a time, for the newest clip asked about: the files of a
+    // replaced clip are not wanted anymore. A fetch runs off the queue, so
+    // a transfer holds up nothing else.
+    let mut fetch: Option<(Stamp, JoinHandle<()>)> = None;
 
     while let Some(job) = jobs.recv().await {
         match job {
-            Job::Record(captured) => clip.record(captured, Vec::new()),
-            Job::Snapshot { captured, paths } => {
-                let files = snapshot(&spool.store, &settings, paths).await;
-                clip.record(*captured, files.clone());
-                spool.store.release(&files);
+            Job::Record {
+                base,
+                captured,
+                paths,
+            } => {
+                let files = if paths.is_empty() {
+                    Vec::new()
+                } else {
+                    // Still worth sharing: with no manifest, the clip is
+                    // the paths as text.
+                    spool(&store, &settings, paths).await.unwrap_or_else(|err| {
+                        tracing::debug!("sharing the paths as text: {err:#}");
+                        Vec::new()
+                    })
+                };
+                clip.record(base, *captured, files);
             }
-            Job::Fetch(id) => {
-                if !asked.lock().unwrap().insert(id) {
+            Job::Copy { paths, ttl, done } => {
+                let copied = match spool(&store, &settings, paths.clone()).await {
+                    Ok(files) => clip.copy_spooled(&paths, files, ttl),
+                    Err(err) => Err(err),
+                };
+                let _ = done.send(copied);
+            }
+            Job::Fetch(stamp) => {
+                if fetch
+                    .as_ref()
+                    .is_some_and(|(asked, task)| *asked >= stamp && !task.is_finished())
+                {
                     continue;
                 }
-                let (clip, peers, settings, spool) =
-                    (clip.clone(), peers.clone(), settings.clone(), spool.clone());
-                let (fetching, asked) = (fetching.clone(), asked.clone());
-                tokio::spawn(async move {
-                    let Ok(_permit) = fetching.acquire().await else {
-                        return;
-                    };
-                    if let Err(err) = materialize(&clip, &peers, &settings, &spool, id).await {
-                        tracing::warn!("cannot bring the files of {id} here: {err:#}");
+                if let Some((_, task)) = fetch.take() {
+                    task.abort();
+                }
+                let (clip, peers, store, settings) =
+                    (clip.clone(), peers.clone(), store.clone(), settings.clone());
+                let task = tokio::spawn(async move {
+                    if let Err(err) = materialize(&clip, &peers, &store, &settings, stamp).await {
+                        tracing::warn!("cannot bring the files of {stamp} here: {err:#}");
                     }
-                    asked.lock().unwrap().remove(&id);
                 });
+                fetch = Some((stamp, task));
             }
-            Job::Sweep => sweep(&clip, &spool.store),
+            Job::Sweep => sweep(&clip, &store).await,
         }
     }
 }
 
-/// Takes a selection's files into the spool, so the entry about to be
-/// written names content this machine can serve.
-///
-/// A selection that cannot be spooled is still worth sharing: the entry
-/// goes out with no manifest, which is the paths as text, exactly what it
-/// was before files were carried at all.
-async fn snapshot(
+/// Takes every file a selection names into the spool, or none of them, so
+/// the clip about to be made names content this machine can serve.
+async fn spool(
     store: &Arc<Store>,
-    settings: &Arc<Settings>,
-    paths: Vec<PathBuf>,
-) -> Vec<FileRef> {
-    let (store, settings) = (store.clone(), settings.clone());
-    let taken = spawn_blocking(move || take_all(&store, &paths, &settings)).await;
-
-    match taken {
-        Ok(Ok(files)) => {
-            tracing::info!("sharing {} file(s), {}", files.len(), size(&files));
-            files
-        }
-        Ok(Err(err)) => {
-            tracing::debug!("sharing the paths as text: {err:#}");
-            Vec::new()
-        }
-        Err(err) => {
-            tracing::warn!("the spool task failed: {err}");
-            Vec::new()
-        }
-    }
-}
-
-/// Spools every file a selection names, or none of them.
-pub fn take_all(
-    store: &Store,
-    paths: &[PathBuf],
     settings: &Settings,
+    paths: Vec<PathBuf>,
 ) -> eyre::Result<Vec<FileRef>> {
-    let budget = settings.file_budget.as_u64();
-    let sources = files::walk(paths, MAX_FILES, settings.max_file_bytes())?;
-    eyre::ensure!(!sources.is_empty(), "the selection names no file");
+    let store = store.clone();
+    let max_bytes = settings.max_file_size.as_u64();
+    let files = spawn_blocking(move || {
+        let sources = files::walk(&paths, files::MAX_FILES, max_bytes)?;
+        eyre::ensure!(!sources.is_empty(), "the selection names no file");
+        sources
+            .into_iter()
+            .map(|source| {
+                let (hash, size) = store.take(&source.from)?;
+                Ok(FileRef {
+                    path: source.path,
+                    size,
+                    hash,
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()
+    })
+    .await
+    .wrap_err("the spool task failed")??;
+    tracing::info!("sharing {} file(s), {}", files.len(), size(&files));
 
-    let wanted = sources.iter().try_fold(0u64, |total, source| {
-        total
-            .checked_add(source.size)
-            .ok_or_else(|| eyre::eyre!("the selection is too large to share"))
-    })?;
-    room(store, wanted, budget)?;
-
-    let mut spooled = Vec::with_capacity(sources.len());
-    for source in sources {
-        let (hash, size) = match store.take_reserved(&source.from) {
-            Ok(taken) => taken,
-            Err(err) => {
-                store.release(&spooled);
-                return Err(err);
-            }
-        };
-        spooled.push(FileRef {
-            path: source.path,
-            size,
-            hash,
-        });
-    }
-
-    Ok(spooled)
+    Ok(files)
 }
 
-/// Refuses what the spool has no room for. Counted once, since walking the
-/// spool is a directory listing and a stat per file in it.
-fn room(store: &Store, wanted: u64, budget: u64) -> eyre::Result<()> {
-    eyre::ensure!(
-        store.size() + wanted <= budget,
-        "the spool has no room for another {} under its {} budget in config.toml",
-        bytesize::ByteSize::b(wanted),
-        bytesize::ByteSize::b(budget),
-    );
-
-    Ok(())
-}
-
-/// Brings an entry's files here and tells the clipboard, retrying while
+/// Brings a clip's files here and tells the clipboard, retrying while
 /// the machines that have them are away.
 async fn materialize(
-    clip: &Arc<ClipService>,
+    clip: &ClipService,
     peers: &PeerSet,
+    store: &Arc<Store>,
     settings: &Settings,
-    spool: &Spool,
-    id: EntryId,
+    stamp: Stamp,
 ) -> eyre::Result<()> {
-    let files = clip.files(id);
+    let files = clip.wanted(stamp);
     if files.is_empty() {
         return Ok(());
     }
-    let total = files::total(&files)?;
     eyre::ensure!(
-        total <= settings.max_file_bytes(),
+        files::total(&files) <= settings.max_file_size.as_u64(),
         "it is over the {} limit in config.toml",
         settings.max_file_size,
     );
-    files::validate(&files)?;
-    room(&spool.store, total, settings.file_budget.as_u64())?;
 
     let mut backoff = Backoff::new(RETRY_MIN, RETRY_MAX);
     for attempt in 1..=RETRIES {
-        match pull_all(&spool.store, peers, id.origin, &files).await {
+        match pull_all(clip, store, peers, stamp, &files).await {
             Ok(()) => break,
-            Err(err) if attempt == RETRIES => return Err(err),
+            Err(err) if attempt == RETRIES || clip.head() != Some(stamp) => return Err(err),
             Err(err) => {
-                tracing::debug!("cannot fetch the files of {id} yet: {err:#}");
+                tracing::debug!("cannot fetch the files of {stamp} yet: {err:#}");
                 tokio::time::sleep(backoff.next_delay()).await;
             }
         }
     }
 
-    let (store, laid_out) = (spool.store.clone(), files.clone());
-    let tree = spawn_blocking(move || store.lay_out(id, &laid_out))
+    let (laid_out, store) = (files.clone(), store.clone());
+    let tree = spawn_blocking(move || store.lay_out(stamp, &laid_out))
         .await
         .wrap_err("the spool task failed")??;
-    tracing::info!("{} file(s) of {id} are here, {}", files.len(), size(&files));
-    clip.materialized(id, tree);
+    tracing::info!(
+        "{} file(s) of {stamp} are here, {}",
+        files.len(),
+        size(&files)
+    );
+    clip.materialized(stamp, tree);
 
     Ok(())
 }
 
-/// Pulls whatever of an entry is not spooled yet.
+/// Pulls whatever of a clip is not spooled yet, asking each machine that
+/// is up for everything still missing in one request, the origin first.
 async fn pull_all(
+    clip: &ClipService,
     store: &Arc<Store>,
     peers: &PeerSet,
-    origin: EndpointId,
+    stamp: Stamp,
     files: &[FileRef],
 ) -> eyre::Result<()> {
-    for file in files {
-        if store.has(file.hash) {
-            continue;
-        }
+    let mut seen = BTreeSet::new();
+    let mut missing: Vec<&FileRef> = files
+        .iter()
+        .filter(|file| !store.has(file.hash) && seen.insert(file.hash))
+        .collect();
 
-        let mut found = false;
-        for (peer, conn) in peers.connected(origin) {
-            match pull(store, &conn, file).await {
-                Ok(true) => {
-                    found = true;
-                    break;
-                }
-                Ok(false) => tracing::debug!("{peer} does not have {}", file.hash),
-                Err(err) => tracing::debug!("cannot pull {} from {peer}: {err:#}", file.hash),
-            }
+    for (peer, conn) in peers.connected(stamp.origin) {
+        if missing.is_empty() {
+            break;
         }
-        eyre::ensure!(found, "no machine that is up has {}", file.hash);
+        if let Err(err) = pull(clip, stamp, store, &conn, &missing).await {
+            tracing::debug!("cannot pull from {peer}: {err:#}");
+        }
+        missing.retain(|file| !store.has(file.hash));
+    }
+    eyre::ensure!(
+        missing.is_empty(),
+        "no machine that is up has {} of the files",
+        missing.len(),
+    );
+
+    Ok(())
+}
+
+/// Pulls `files` from one peer over a single stream, resuming each where
+/// a previous attempt left off, and giving up once the clip is replaced:
+/// its fetch would hold up the next one's. The files the peer does not
+/// have are skipped.
+async fn pull(
+    clip: &ClipService,
+    stamp: Stamp,
+    store: &Arc<Store>,
+    conn: &Connection,
+    files: &[&FileRef],
+) -> eyre::Result<()> {
+    let at: Vec<u64> = files
+        .iter()
+        .map(|file| store.partial(file.hash, file.size))
+        .collect();
+    let ask = Ask::Contents(
+        files
+            .iter()
+            .zip(&at)
+            .map(|(file, &at)| ContentRequest {
+                hash: file.hash,
+                at,
+            })
+            .collect(),
+    );
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+    write_message(&mut send, &ask, proto::MAX_REQUEST_SIZE).await?;
+    send.finish()?;
+
+    for (file, at) in files.iter().zip(at) {
+        eyre::ensure!(clip.head() == Some(stamp), "the clip was replaced");
+        let reply = tokio::time::timeout(
+            CHUNK_TIMEOUT,
+            read_message::<ContentReply>(&mut recv, proto::MAX_REPLY_SIZE),
+        )
+        .await
+        .wrap_err("the transfer stalled")??;
+        if let ContentReply::Sending { size } = reply {
+            eyre::ensure!(
+                at.checked_add(size) == Some(file.size),
+                "a peer offered {} bytes where the clip says {}",
+                at.saturating_add(size),
+                file.size,
+            );
+            receive(store, &mut recv, file, at).await?;
+        }
     }
 
     Ok(())
 }
 
-/// Pulls one file from one peer, resuming where a previous attempt left
-/// off. Answers whether that peer had it at all.
-async fn pull(store: &Arc<Store>, conn: &Connection, file: &FileRef) -> eyre::Result<bool> {
-    let mut incoming = {
-        let (store, hash) = (store.clone(), file.hash);
+/// Takes the rest of `file`, past the `at` bytes already here, off the
+/// stream and into the spool.
+///
+/// Content that turns out not to be what it was named is only logged: the
+/// stream is still in step, and the next file is worth having.
+async fn receive(
+    store: &Arc<Store>,
+    recv: &mut RecvStream,
+    file: &FileRef,
+    at: u64,
+) -> eyre::Result<()> {
+    let hash = file.hash;
+    let incoming = {
+        let store = store.clone();
         spawn_blocking(move || store.receive(hash))
             .await
             .wrap_err("the spool task failed")??
     };
-    let at = incoming.at().min(file.size);
-
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let ask = Ask::Content(ContentRequest {
-        hash: file.hash,
-        at,
-    });
-    write_message(&mut send, &ask, proto::MAX_REQUEST_SIZE).await?;
-    send.finish()?;
-
-    let reply = read_message::<ContentReply>(&mut recv, proto::MAX_REQUEST_SIZE).await?;
-    let size = match reply {
-        ContentReply::Missing => return Ok(false),
-        ContentReply::Sending { size } => size,
-    };
-    eyre::ensure!(
-        at.checked_add(size) == Some(file.size),
-        "a peer offered {} bytes where the entry says {}",
-        at.saturating_add(size),
-        file.size,
-    );
+    eyre::ensure!(incoming.at() == at, "the partial transfer of {hash} moved");
 
     // The bytes go to disk on a thread of their own: a file arriving at
     // the speed of a local network must not put its writes on the runtime.
     // What it does *not* do is finish the transfer, so a stream that dies
     // halfway leaves what it wrote where the next attempt resumes from.
-    let (chunks, mut queue) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
-    let writing = spawn_blocking(move || {
-        while let Some(chunk) = queue.blocking_recv() {
-            incoming.write(&chunk)?;
-        }
+    let (chunks, queue) = mpsc::channel(WRITE_QUEUE);
+    let writing = spawn_blocking(move || write_queued(incoming, queue));
 
-        Ok::<_, eyre::Report>(incoming)
-    });
-
-    let mut left = size;
-    let mut chunk = vec![0u8; proto::CONTENT_CHUNK];
+    let mut left = file.size - at;
     while left > 0 {
-        let want = usize::try_from(left).unwrap_or(usize::MAX).min(chunk.len());
-        let read = tokio::time::timeout(CHUNK_TIMEOUT, recv.read(&mut chunk[..want]))
+        let want = usize::try_from(left).unwrap_or(usize::MAX);
+        let read = tokio::time::timeout(CHUNK_TIMEOUT, recv.read_chunk(want))
             .await
             .wrap_err("the transfer stalled")??;
-        match read {
-            Some(0) | None => eyre::bail!("the transfer stopped {left} bytes short"),
-            Some(read) => {
-                left -= read as u64;
-                chunks
-                    .send(chunk[..read].to_vec())
-                    .await
-                    .map_err(|_| eyre::eyre!("cannot write the transfer"))?;
-            }
-        }
+        let Some(chunk) = read else {
+            eyre::bail!("the transfer stopped {left} bytes short");
+        };
+        left -= chunk.len() as u64;
+        chunks
+            .send(chunk)
+            .await
+            .map_err(|_| eyre::eyre!("cannot write the transfer"))?;
     }
     drop(chunks);
     let incoming = writing.await.wrap_err("the spool task failed")??;
 
     let store = store.clone();
-    spawn_blocking(move || incoming.finish(&store))
+    let finished = spawn_blocking(move || incoming.finish(&store))
         .await
-        .wrap_err("the spool task failed")??;
+        .wrap_err("the spool task failed")?;
+    if let Err(err) = finished {
+        tracing::warn!("{err:#}");
+    }
 
-    Ok(true)
+    Ok(())
 }
 
-/// Drops the content and the trees no entry names any more.
-///
-/// The history is what decides: an entry that aged out, was forgotten or
-/// expired takes its files with it, the way its log file goes.
-fn sweep(clip: &ClipService, store: &Arc<Store>) {
-    let (entries, content) = clip.referenced();
+/// Writes what arrives on `queue` until it closes.
+fn write_queued(
+    mut incoming: Incoming,
+    mut queue: mpsc::Receiver<impl AsRef<[u8]>>,
+) -> eyre::Result<Incoming> {
+    while let Some(chunk) = queue.blocking_recv() {
+        incoming.write(chunk.as_ref())?;
+    }
+
+    Ok(incoming)
+}
+
+/// Drops the content and the trees the clip does not name.
+async fn sweep(clip: &ClipService, store: &Arc<Store>) {
+    let (live, content) = clip.referenced();
     let store = store.clone();
 
-    tokio::task::spawn_blocking(move || {
-        if let Err(err) = store.sweep(&entries, &content) {
-            tracing::warn!("cannot sweep the file spool: {err:#}");
-        }
-    });
+    let swept = spawn_blocking(move || store.sweep(live, &content))
+        .await
+        .wrap_err("the spool task failed")
+        .and_then(|swept| swept);
+    if let Err(err) = swept {
+        tracing::warn!("cannot sweep the file spool: {err:#}");
+    }
 }
 
 /// What a manifest weighs, for the log lines a person reads.
 fn size(files: &[FileRef]) -> bytesize::ByteSize {
-    bytesize::ByteSize::b(files::total(files).unwrap_or(u64::MAX))
+    bytesize::ByteSize::b(files::total(files))
 }

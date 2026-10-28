@@ -7,7 +7,7 @@
 //!
 //! A `--dir` override collapses all three into one directory, which keeps
 //! several independent daemons (tests, a second identity) from sharing a
-//! socket or a history.
+//! socket or a clipboard.
 
 use std::{
     fs,
@@ -22,12 +22,12 @@ use eyre::WrapErr as _;
 pub struct Dirs {
     config: PathBuf,
     state: PathBuf,
-    /// Where the control socket goes. `None` falls back to the state
-    /// directory, which is also what an overridden root does.
-    runtime: Option<PathBuf>,
-    /// Whether the roots came from `--dir`, which the service installer
-    /// must then bake into the service definition.
-    custom: bool,
+    /// Where the control socket goes: the state directory when there is
+    /// no runtime one.
+    runtime: PathBuf,
+    /// The `--dir` override, which the service installer must then bake
+    /// into the service definition.
+    root: Option<PathBuf>,
 }
 
 impl Dirs {
@@ -41,16 +41,15 @@ impl Dirs {
 
             return Ok(Dirs {
                 config: root.clone(),
-                state: root,
-                runtime: None,
-                custom: true,
+                state: root.clone(),
+                runtime: root.clone(),
+                root: Some(root),
             });
         }
 
         let base = etcetera::choose_base_strategy()
             .wrap_err("cannot determine the XDG base directories")?;
-        // `state_dir` is only `None` on platforms without the notion; on
-        // Linux, the one platform we support, it is always set.
+        // `state_dir` is only `None` on Windows.
         let state = base
             .state_dir()
             .unwrap_or_else(|| base.data_dir())
@@ -62,30 +61,20 @@ impl Dirs {
 
         Ok(Dirs {
             config,
+            runtime: base.runtime_dir().unwrap_or_else(|| state.clone()),
             state,
-            runtime: base.runtime_dir(),
-            custom: false,
+            root: None,
         })
     }
 
-    /// Whether the roots were overridden on the command line.
-    pub fn is_custom(&self) -> bool {
-        self.custom
-    }
-
-    /// The root the CLI reports, for messages pointing the user at files.
-    pub fn config_root(&self) -> &Path {
-        &self.config
+    /// The directory everything is under, when overridden with `--dir`.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// The hand-edited settings (`config.toml`).
     pub fn settings_file(&self) -> PathBuf {
         self.config.join("config.toml")
-    }
-
-    /// The record of who installed the background service.
-    pub fn service_file(&self) -> PathBuf {
-        self.config.join("service.toml")
     }
 
     /// This machine's private identity key.
@@ -98,33 +87,37 @@ impl Dirs {
         self.state.join("mesh.json")
     }
 
-    /// Clipboard state that is not an entry: sequence, clock, pause.
+    /// The clipboard and the pause, as last saved.
     pub fn clip_file(&self) -> PathBuf {
-        self.state.join("clip.json")
+        self.state.join("clip.bin")
     }
 
-    /// The directory holding one file per persisted log entry.
-    pub fn history_dir(&self) -> PathBuf {
-        self.state.join("history")
-    }
-
-    /// The spool of copied files: content by hash, and the trees entries
-    /// are laid out in.
+    /// The spool of copied files: content by hash, and the tree the clip
+    /// is laid out in.
     pub fn files_dir(&self) -> PathBuf {
         self.state.join("files")
     }
 
     /// The control socket the CLI dials.
     pub fn socket_file(&self) -> PathBuf {
-        match &self.runtime {
-            Some(runtime) => runtime.join("yank.sock"),
-            None => self.state.join("yank.sock"),
-        }
+        self.runtime.join("yank.sock")
+    }
+}
+
+/// Reads a file with `read`, `None` when there is no file.
+pub fn read_existing<'a, T>(
+    path: &'a Path,
+    read: impl FnOnce(&'a Path) -> std::io::Result<T>,
+) -> eyre::Result<Option<T>> {
+    match read(path) {
+        Ok(read) => Ok(Some(read)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).wrap_err_with(|| format!("cannot read {}", path.display())),
     }
 }
 
 /// Creates a directory and every missing parent, readable by its owner
-/// only: these hold the identity key and the clipboard history.
+/// only: these hold the identity key and the clipboard.
 pub fn create_private(path: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 

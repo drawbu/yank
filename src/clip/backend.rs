@@ -28,12 +28,16 @@
 //! macOS has no such event and a backend there polls `changeCount`. Either
 //! way what comes out is [`Event::Copied`].
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use tokio::sync::mpsc::UnboundedSender;
+use zeroize::Zeroizing;
 
-use super::event::Selection;
-use crate::log::Payload;
+use super::Selection;
+
+/// Bytes served to pasting applications. Shared between the requests
+/// serving them, and wiped when the last one lets go.
+pub type Payload = Arc<Zeroizing<Vec<u8>>>;
 
 /// What the daemon asks a backend to do.
 #[derive(Debug)]
@@ -65,10 +69,20 @@ pub struct Captured {
 
 /// One representation of a selection to hand a pasting application: the
 /// bytes, and every type they are announced under.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Serve {
     pub mimes: Vec<String>,
     pub bytes: Payload,
+}
+
+impl std::fmt::Debug for Serve {
+    /// Leaves the bytes out: they may be a password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Serve")
+            .field("mimes", &self.mimes)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// What a backend is allowed to capture.
@@ -80,17 +94,13 @@ pub struct Policy {
     pub ignore: Vec<String>,
 }
 
-/// A running backend. Dropping it stops it.
-///
-/// Commands are queued rather than performed: a backend is somewhere else,
-/// on a thread or behind a run loop, and the daemon must not wait on it.
-pub trait Backend: std::fmt::Debug + Send + Sync {
-    fn send(&self, command: Command);
-}
-
 /// The backend of this platform, named at compile time: a platform is not
 /// something a machine changes its mind about, so the daemon holds the one
 /// there is rather than paying for a choice it never makes.
+///
+/// Dropping it stops it. Its `send` queues a command rather than
+/// performing it: a backend is somewhere else, on a thread or behind a run
+/// loop, and the daemon must not wait on it.
 #[cfg(target_os = "linux")]
 pub type Platform = super::wayland::Wayland;
 
@@ -100,8 +110,8 @@ pub type Platform = super::wayland::Wayland;
 pub enum Platform {}
 
 #[cfg(not(target_os = "linux"))]
-impl Backend for Platform {
-    fn send(&self, _command: Command) {
+impl Platform {
+    pub fn send(&self, _command: Command) {
         match *self {}
     }
 }
@@ -111,7 +121,7 @@ impl Backend for Platform {
 pub async fn locate() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        match crate::config::wayland_socket().await {
+        match super::wayland::session_socket().await {
             Ok(socket) => socket,
             Err(err) => {
                 tracing::debug!("cannot ask the session for its compositor: {err:#}");

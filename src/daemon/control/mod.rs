@@ -1,9 +1,8 @@
-//! Control socket protocol and client.
+//! The control socket: what the CLI asks the daemon, and the daemon's
+//! side of it.
 
-mod client;
 mod protocol;
 mod server;
 
-pub use client::{Client, request, talk};
 pub use protocol::*;
 pub(super) use server::{Context, Server};

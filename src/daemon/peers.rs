@@ -9,19 +9,24 @@
 //! The set also *is* the allowlist: an incoming connection whose machine
 //! is not paired has nowhere to be routed and is refused.
 //!
-//! Each connection runs three things at once:
+//! Each connection runs four things at once:
 //!
 //! ```text
 //!   incoming uni  ─► membership  ─► the mesh state
-//!                 └─ summary     ─► the fetcher below
-//!   incoming bi   ─► entries ask ─► entries streamed back
+//!                 └─ head        ─► the fetcher below
+//!   incoming bi   ─► clip ask    ─► our clip sent back
 //!                 └─ content ask ─► a file streamed out of the spool
-//!   fetcher       ─► entries ask ─► entries handed to the topic
+//!   fetcher       ─► clip ask    ─► the peer's clip, to the clipboard
+//!   sender        ◄─ our mesh state and head, on connect and change
 //! ```
 //!
-//! The fetcher is a task of its own so that pulling from a peer never
-//! stops us serving it: two machines that both went offline come back and
-//! pull from each other at the same time.
+//! The fetcher and the sender are tasks of their own so that talking to a
+//! peer never stops us serving it. Both belong to the connection and die
+//! with it.
+//!
+//! The sender only ever sends the latest of each: everything it carries
+//! is idempotent and latest-wins, so a slow peer or one that just
+//! reconnected receives the current state rather than a backlog.
 
 use std::{
     collections::BTreeMap,
@@ -34,17 +39,18 @@ use iroh::{
     Endpoint, EndpointId, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream},
 };
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 
-use super::{backoff::Backoff, control, hub::Hub, topics::Topics};
+use super::{backoff::Backoff, clip::ClipService, control};
 use crate::{
-    config::{Membership, MeshState},
+    clip::{Clip, Stamp},
+    config::MeshState,
     files::Store,
-    log::WireEntry,
     net::{
-        proto::{
-            self, Ask, ContentReply, ContentRequest, FetchFrame, FetchRequest, Summary, UniMessage,
-        },
+        proto::{self, Ask, ContentReply, ContentRequest, UniMessage},
         wire::{read_message, write_message},
     },
 };
@@ -53,12 +59,17 @@ use crate::{
 /// slot forever.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Budget for a whole fetch, from opening the stream to the last entry.
+/// Budget for a whole pull, from opening the stream to the last byte.
 const FETCH_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Pending announcements per connection. Full means a flood, and dropping
-/// is safe: the next announcement or reconnect says the same thing.
-const SUMMARY_QUEUE: usize = 16;
+/// Budget for sending one message. A connection that cannot take one is
+/// dropped, and the redial sends the current state again.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the mesh state and the head are re-sent although nothing
+/// changed. Neither is acknowledged, so one lost would otherwise stay
+/// lost until the next unrelated change.
+const ANTI_ENTROPY: Duration = Duration::from_mins(5);
 
 /// Delay before redialing after a first failure; doubles up to the
 /// ceiling.
@@ -74,13 +85,13 @@ const STABLE_UPTIME: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct PeerSet {
     endpoint: Endpoint,
-    local_id: EndpointId,
-    hub: Arc<Hub>,
-    topics: Arc<Topics>,
-    /// The spool, to serve a peer the content an entry named.
+    clip: Arc<ClipService>,
+    /// The mesh state, to gossip it.
+    mesh: watch::Receiver<MeshState>,
+    /// Mesh states received from peers, merged by the store.
+    gossip: mpsc::Sender<MeshState>,
+    /// The spool, to serve a peer the content a clip named.
     store: Arc<Store>,
-    /// Memberships received from peers, drained by the daemon.
-    gossip: mpsc::Sender<(EndpointId, Membership)>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
 }
 
@@ -104,19 +115,17 @@ enum PeerState {
 impl PeerSet {
     pub fn new(
         endpoint: Endpoint,
-        local_id: EndpointId,
-        hub: Arc<Hub>,
-        topics: Arc<Topics>,
+        clip: Arc<ClipService>,
+        mesh: watch::Receiver<MeshState>,
+        gossip: mpsc::Sender<MeshState>,
         store: Arc<Store>,
-        gossip: mpsc::Sender<(EndpointId, Membership)>,
     ) -> Self {
         PeerSet {
             endpoint,
-            local_id,
-            hub,
-            topics,
-            store,
+            clip,
+            mesh,
             gossip,
+            store,
             peers: Mutex::new(BTreeMap::new()),
         }
     }
@@ -137,16 +146,6 @@ impl PeerSet {
             let handle = peers.remove(&id).expect("the id came from this map");
             tracing::info!(peer = %handle.name, "removing machine");
             handle.shutdown();
-
-            // An aborted task stops at its next await point, which may be
-            // *after* it registered a connection with the hub. Cleaning up
-            // once it is truly gone is what stops a removed machine from
-            // still being sent announcements.
-            let hub = self.hub.clone();
-            tokio::spawn(async move {
-                let _ = handle.task.await;
-                hub.disconnected(&id);
-            });
         }
 
         for (id, handle) in peers.iter_mut() {
@@ -209,12 +208,12 @@ impl PeerSet {
     }
 
     /// A snapshot of every machine, for `yank status`.
-    pub fn statuses(&self) -> Vec<control::PeerStatus> {
+    pub fn statuses(&self) -> Vec<control::PeerInfo> {
         let peers = self.peers.lock().unwrap();
 
         peers
-            .iter()
-            .map(|(id, handle)| {
+            .values()
+            .map(|handle| {
                 let connection = match &*handle.state.lock().unwrap() {
                     PeerState::Connecting => control::ConnectionStatus::Connecting,
                     PeerState::Backoff { until } => control::ConnectionStatus::Backoff {
@@ -226,9 +225,8 @@ impl PeerSet {
                     },
                 };
 
-                control::PeerStatus {
+                control::PeerInfo {
                     name: handle.name.clone(),
-                    endpoint: *id,
                     connection,
                 }
             })
@@ -241,14 +239,13 @@ impl PeerSet {
 
         let task = tokio::spawn(run_peer(PeerTask {
             endpoint: self.endpoint.clone(),
-            local_id: self.local_id,
             peer_id,
             name: name.clone(),
             state: state.clone(),
-            hub: self.hub.clone(),
-            topics: self.topics.clone(),
-            store: self.store.clone(),
+            clip: self.clip.clone(),
+            mesh: self.mesh.clone(),
             gossip: self.gossip.clone(),
+            store: self.store.clone(),
             inbound: rx,
         }));
 
@@ -295,14 +292,13 @@ fn route_of(conn: &Connection) -> Option<control::Route> {
 /// Everything one peer task owns.
 struct PeerTask {
     endpoint: Endpoint,
-    local_id: EndpointId,
     peer_id: EndpointId,
     name: String,
     state: Arc<Mutex<PeerState>>,
-    hub: Arc<Hub>,
-    topics: Arc<Topics>,
+    clip: Arc<ClipService>,
+    mesh: watch::Receiver<MeshState>,
+    gossip: mpsc::Sender<MeshState>,
     store: Arc<Store>,
-    gossip: mpsc::Sender<(EndpointId, Membership)>,
     inbound: mpsc::Receiver<Connection>,
 }
 
@@ -358,7 +354,7 @@ impl PeerTask {
     async fn establish(&mut self) -> Option<(Connection, bool)> {
         self.set_state(PeerState::Connecting);
 
-        if self.local_id < self.peer_id {
+        if self.endpoint.id() < self.peer_id {
             dial(&self.endpoint, self.peer_id, &self.name)
                 .await
                 .map(|conn| (conn, true))
@@ -376,15 +372,7 @@ impl PeerTask {
     async fn serve(&mut self, mut conn: Connection, mut outbound: bool) {
         let mut since = SystemTime::now();
 
-        let (mut summaries, inbox) = mpsc::channel(SUMMARY_QUEUE);
-        let mut fetcher = tokio::spawn(run_fetcher(
-            conn.clone(),
-            self.topics.clone(),
-            self.name.clone(),
-            inbox,
-        ));
-
-        self.hub.connected(self.peer_id, &conn);
+        let (mut heads, mut tasks) = self.spawn_tasks(&conn);
         loop {
             self.set_state(PeerState::Connected {
                 conn: conn.clone(),
@@ -400,34 +388,27 @@ impl PeerTask {
                     // Keep the connection dialed by the lower id: both
                     // sides pick the same one, so the duplicate dies
                     // without taking the survivor with it.
-                    if outbound && self.local_id < self.peer_id {
+                    if outbound && self.endpoint.id() < self.peer_id {
                         new.close(0u32.into(), b"duplicate");
                     } else {
                         conn.close(0u32.into(), b"duplicate");
                         conn = new;
                         outbound = false;
                         since = SystemTime::now();
-                        // The fetcher belongs to the connection it pulls
-                        // over, and its record of which announcements it
-                        // has seen only means anything on that one.
-                        fetcher.abort();
-                        let (next, inbox) = mpsc::channel(SUMMARY_QUEUE);
-                        summaries = next;
-                        fetcher = tokio::spawn(run_fetcher(
-                            conn.clone(),
-                            self.topics.clone(),
-                            self.name.clone(),
-                            inbox,
-                        ));
-                        self.hub.connected(self.peer_id, &conn);
+                        (heads, tasks) = self.spawn_tasks(&conn);
                     }
+                }
+                Some(_) = tasks.join_next() => {
+                    tracing::debug!(peer = %self.name, "connection stalled");
+                    conn.close(0u32.into(), b"stalled");
+                    break;
                 }
                 stream = conn.accept_uni() => {
                     let Ok(stream) = stream else {
                         tracing::debug!(peer = %self.name, "connection lost");
                         break;
                     };
-                    self.serve_uni(stream, &summaries);
+                    self.serve_uni(stream, &heads);
                 }
                 stream = conn.accept_bi() => {
                     let Ok((send, recv)) = stream else {
@@ -438,16 +419,33 @@ impl PeerTask {
                 }
             }
         }
-
-        fetcher.abort();
-        self.hub.disconnected(&self.peer_id);
     }
 
-    /// Reads one announcement or membership and routes it.
-    fn serve_uni(&self, mut stream: RecvStream, summaries: &mpsc::Sender<Summary>) {
+    /// Starts the fetcher and the sender of `conn`. Dropping the set stops
+    /// both.
+    fn spawn_tasks(&self, conn: &Connection) -> (watch::Sender<Option<Stamp>>, JoinSet<()>) {
+        let (heads, inbox) = watch::channel(None);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(run_fetcher(
+            conn.clone(),
+            self.clip.clone(),
+            self.name.clone(),
+            inbox,
+        ));
+        tasks.spawn(run_sender(
+            conn.clone(),
+            self.mesh.clone(),
+            self.clip.subscribe(),
+            self.name.clone(),
+        ));
+
+        (heads, tasks)
+    }
+
+    /// Reads one head or membership and routes it.
+    fn serve_uni(&self, mut stream: RecvStream, heads: &watch::Sender<Option<Stamp>>) {
         let gossip = self.gossip.clone();
-        let summaries = summaries.clone();
-        let peer = self.peer_id;
+        let heads = heads.clone();
         let name = self.name.clone();
         tokio::spawn(async move {
             let read = tokio::time::timeout(
@@ -459,22 +457,24 @@ impl PeerTask {
                 Ok(Err(err)) => return tracing::debug!(peer = %name, "bad message: {err:#}"),
                 Err(_) => return tracing::debug!(peer = %name, "message timed out"),
             };
-            if let Err(err) = message.validate() {
-                return tracing::debug!(peer = %name, "bad message: {err:#}");
-            }
 
-            // A full queue means a flood in either direction; dropping is
-            // safe, since the next change or reconnect says it again.
             match message {
-                UniMessage::Membership(membership) => {
-                    if gossip.try_send((peer, membership)).is_err() {
-                        tracing::debug!(peer = %name, "dropping a membership: the queue is full");
+                // A full queue means a flood; dropping is safe, since the
+                // next change or the periodic resend says it again.
+                UniMessage::Membership(state) => {
+                    if gossip.try_send(state).is_err() {
+                        tracing::debug!(peer = %name, "dropping a mesh state: the queue is full");
                     }
                 }
-                UniMessage::Summary(summary) => {
-                    if summaries.try_send(summary).is_err() {
-                        tracing::debug!(peer = %name, "dropping an announcement: the queue is full");
-                    }
+                // Streams carry no order between them: keep the newest.
+                // An equal one still wakes the fetcher, which is how a
+                // failed pull is retried. One too far ahead would be
+                // refused, and kept, it would hide every head after it.
+                UniMessage::Head(head) if head.is_plausible() => {
+                    heads.send_modify(|held| *held = (*held).max(Some(head)));
+                }
+                UniMessage::Head(_) => {
+                    tracing::debug!(peer = %name, "ignoring a head from too far ahead");
                 }
             }
         });
@@ -482,7 +482,7 @@ impl PeerTask {
 
     /// Answers whatever a peer opened a stream to ask for.
     fn serve_ask(&self, send: SendStream, mut recv: RecvStream) {
-        let topics = self.topics.clone();
+        let clip = self.clip.clone();
         let store = self.store.clone();
         let name = self.name.clone();
         tokio::spawn(async move {
@@ -495,10 +495,13 @@ impl PeerTask {
                 Ok(Err(err)) => return tracing::debug!(peer = %name, "bad request: {err:#}"),
                 Err(_) => return tracing::debug!(peer = %name, "request timed out"),
             };
+            if let Err(err) = ask.validate() {
+                return tracing::debug!(peer = %name, "bad request: {err:#}");
+            }
 
             let served = match ask {
-                Ask::Entries(request) => send_entries(send, &topics, &request).await,
-                Ask::Content(request) => send_content(send, &store, &request).await,
+                Ask::Clip => send_clip(send, clip.clip()).await,
+                Ask::Contents(requests) => send_contents(send, &store, &requests).await,
             };
             if let Err(err) = served {
                 tracing::debug!(peer = %name, "cannot serve a request: {err:#}");
@@ -511,144 +514,141 @@ impl PeerTask {
     }
 }
 
-/// Streams a file out of the spool, or says it is not here.
+/// Streams files out of the spool, in the order asked, each one either
+/// said to be missing or sent raw after its header.
 ///
-/// Sent raw after the header rather than framed: a file does not fit in a
-/// frame, and the receiver knows what it asked for, so it knows when it
-/// has it all. What it may not know is whether the bytes are the ones it
-/// asked for, which is why they are named by their hash.
-async fn send_content(
+/// Raw rather than framed: a file does not fit in a frame, and the
+/// receiver knows how much follows each header. What it may not know is
+/// whether the bytes are the ones it asked for, which is why they are
+/// named by their hash. Exactly the size announced is sent, or the stream
+/// fails: a short file would have the rest read as the next one.
+async fn send_contents(
     mut send: SendStream,
     store: &Store,
-    request: &ContentRequest,
+    requests: &[ContentRequest],
 ) -> eyre::Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-    let blob = store.blob(request.hash);
-    let Ok(mut file) = tokio::fs::File::open(&blob).await else {
-        write_message(&mut send, &ContentReply::Missing, proto::MAX_REQUEST_SIZE).await?;
-        send.finish()?;
-
-        return Ok(());
-    };
-
-    let size = file.metadata().await?.len();
-    let at = request.at.min(size);
-    file.seek(std::io::SeekFrom::Start(at)).await?;
-    write_message(
-        &mut send,
-        &ContentReply::Sending { size: size - at },
-        proto::MAX_REQUEST_SIZE,
-    )
-    .await?;
-
     let mut chunk = vec![0u8; proto::CONTENT_CHUNK];
-    loop {
-        let read = file.read(&mut chunk).await?;
-        if read == 0 {
-            break;
+    for request in requests {
+        let Ok(mut file) = tokio::fs::File::open(store.blob(request.hash)).await else {
+            write_message(&mut send, &ContentReply::Missing, proto::MAX_REPLY_SIZE).await?;
+            continue;
+        };
+
+        let size = file.metadata().await?.len();
+        let at = request.at.min(size);
+        file.seek(std::io::SeekFrom::Start(at)).await?;
+        let mut left = size - at;
+        write_message(
+            &mut send,
+            &ContentReply::Sending { size: left },
+            proto::MAX_REPLY_SIZE,
+        )
+        .await?;
+
+        while left > 0 {
+            let want = usize::try_from(left).unwrap_or(usize::MAX).min(chunk.len());
+            let read = file.read(&mut chunk[..want]).await?;
+            eyre::ensure!(read > 0, "{} shrank while being sent", request.hash);
+            send.write_all(&chunk[..read]).await?;
+            left -= read as u64;
         }
-        send.write_all(&chunk[..read]).await?;
     }
     send.finish()?;
 
     Ok(())
 }
 
-/// Streams the entries a peer asked for, then says so.
-async fn send_entries(
-    mut send: SendStream,
-    topics: &Topics,
-    request: &FetchRequest,
-) -> eyre::Result<()> {
-    for entry in topics.since(request.topic, &request.since) {
-        let frame = FetchFrame::Entry(entry);
-        write_message(&mut send, &frame, proto::MAX_FRAME_SIZE).await?;
-    }
-    write_message(&mut send, &FetchFrame::End, proto::MAX_FRAME_SIZE).await?;
+/// Sends our clip to a peer that asked for it.
+async fn send_clip(mut send: SendStream, clip: Option<Arc<Clip>>) -> eyre::Result<()> {
+    write_message(&mut send, &clip, proto::MAX_CLIP_SIZE).await?;
     send.finish()?;
 
     Ok(())
 }
 
-/// Pulls from one peer whenever it announces something we lack.
+/// Sends a peer our mesh state and head: both on connect, each again when
+/// it changes, and both periodically. Returns when the connection cannot
+/// take a message.
 ///
-/// One at a time, and re-checked after every pull, so a peer that
-/// announces while we are already pulling from it is not missed and does
-/// not start a second pull. A failed pull is not retried here: the peer's
-/// next announcement, or the periodic one, comes back to it.
+/// The mesh state goes first: a machine should learn who is in the mesh
+/// before it is told what to fetch.
+async fn run_sender(
+    conn: Connection,
+    mut mesh: watch::Receiver<MeshState>,
+    mut head: watch::Receiver<Option<Stamp>>,
+    name: String,
+) {
+    let mut resend = tokio::time::interval(ANTI_ENTROPY);
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = resend.tick() => {
+                mesh.mark_changed();
+                head.mark_changed();
+                continue;
+            }
+            Ok(()) = mesh.changed() => UniMessage::Membership(mesh.borrow_and_update().clone()),
+            Ok(()) = head.changed() => match *head.borrow_and_update() {
+                Some(head) => UniMessage::Head(head),
+                None => continue,
+            },
+        };
+
+        let sent = tokio::time::timeout(SEND_TIMEOUT, async {
+            let mut stream = conn.open_uni().await?;
+            write_message(&mut stream, &message, proto::MAX_UNI_SIZE).await?;
+            stream.finish()?;
+            eyre::Ok(())
+        });
+        match sent.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return tracing::debug!(peer = %name, "cannot send: {err:#}"),
+            Err(_) => return tracing::debug!(peer = %name, "sending timed out"),
+        }
+    }
+}
+
+/// Pulls from one peer whenever it announces a newer clip than ours.
+///
+/// One at a time: heads announced meanwhile collapse into the newest, which
+/// is checked again after the pull. A failed pull is not retried here: the
+/// peer's next announcement, or the periodic one, comes back to it.
 async fn run_fetcher(
     conn: Connection,
-    topics: Arc<Topics>,
+    clip: Arc<ClipService>,
     name: String,
-    mut summaries: mpsc::Receiver<Summary>,
+    mut heads: watch::Receiver<Option<Stamp>>,
 ) {
-    let mut last_seq = 0;
-
-    while let Some(summary) = summaries.recv().await {
-        // Streams have no order between them, so an announcement that
-        // overtook a newer one is discarded rather than acted on.
-        if summary.seq <= last_seq {
+    while heads.changed().await.is_ok() {
+        let head = *heads.borrow_and_update();
+        if head <= clip.head() {
             continue;
         }
-        last_seq = summary.seq;
 
-        while summary.have.outruns(&topics.have(summary.topic)) {
-            let have = topics.have(summary.topic);
-            let pulled = tokio::time::timeout(FETCH_TIMEOUT, fetch(&conn, summary.topic, have));
-            let entries = match pulled.await {
-                Ok(Ok(entries)) => entries,
-                Ok(Err(err)) => {
-                    tracing::debug!(peer = %name, "cannot fetch: {err:#}");
-                    break;
+        match tokio::time::timeout(FETCH_TIMEOUT, fetch(&conn)).await {
+            Ok(Ok(Some(pulled))) => {
+                if let Err(err) = clip.accept(pulled) {
+                    tracing::warn!(peer = %name, "refusing its clip: {err:#}");
                 }
-                Err(_) => {
-                    tracing::debug!(peer = %name, "fetch timed out");
-                    break;
-                }
-            };
-            // Nothing came back although the peer said it had more: it
-            // dropped those entries. Asking again would loop.
-            if entries.is_empty() {
-                break;
             }
-
-            tracing::debug!(peer = %name, "fetched {} entries", entries.len());
-            if let Err(err) = topics.accept(summary.topic, entries) {
-                tracing::debug!(peer = %name, "cannot apply what was fetched: {err:#}");
-                break;
-            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => tracing::debug!(peer = %name, "cannot fetch: {err:#}"),
+            Err(_) => tracing::debug!(peer = %name, "fetch timed out"),
         }
     }
 }
 
-/// Asks a peer for everything past `since`.
-async fn fetch(
-    conn: &Connection,
-    topic: proto::Topic,
-    since: crate::log::Watermark,
-) -> eyre::Result<Vec<WireEntry>> {
+/// Asks a peer for its clip.
+async fn fetch(conn: &Connection) -> eyre::Result<Option<Clip>> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    let request = Ask::Entries(FetchRequest { topic, since });
-    write_message(&mut send, &request, proto::MAX_REQUEST_SIZE).await?;
+    write_message(&mut send, &Ask::Clip, proto::MAX_REQUEST_SIZE).await?;
     send.finish()?;
 
-    let mut entries = Vec::new();
-    loop {
-        let frame = read_message::<FetchFrame>(&mut recv, proto::MAX_FRAME_SIZE)
-            .await
-            .wrap_err("cannot read the answer")?;
-        match frame {
-            FetchFrame::Entry(entry) => {
-                eyre::ensure!(
-                    entries.len() < proto::MAX_FETCH_ENTRIES,
-                    "the peer sent more entries than a log can hold",
-                );
-                entries.push(entry);
-            }
-            FetchFrame::End => return Ok(entries),
-        }
-    }
+    read_message(&mut recv, proto::MAX_CLIP_SIZE)
+        .await
+        .wrap_err("cannot read the answer")
 }
 
 /// Dials a peer on the replication ALPN.

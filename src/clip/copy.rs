@@ -1,41 +1,30 @@
-//! What a clipboard log entry says.
-//!
-//! These are the payloads [`crate::log`] carries around. Everything the
-//! clipboard does is one of them, including the destructive operations:
-//! emptying the clipboard and dropping history are events like any other,
-//! so they reach a machine that was offline when they happened instead of
-//! being forgotten the moment the network was down.
+//! What the clipboard holds, as machines exchange it.
 
 use std::path::PathBuf;
 
-use eyre::WrapErr as _;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize as _;
 
-use super::mime;
-use crate::{
-    files::{self, FileRef},
-    log::{EntryId, Payload, payload},
-};
+use super::{MAX_SIZE, Stamp, mime};
+use crate::files::{self, FileRef};
 
-/// One clipboard event.
-///
-/// Postcard encodes variants by position: existing ones keep their
-/// position and meaning, new ones are appended. A machine that meets an
-/// event it cannot decode ignores it rather than refusing the entry, so a
-/// mesh running two versions still works for what both understand.
+/// How much of a copy [`Copy::preview`] keeps.
+const PREVIEW_CHARS: usize = 72;
+
+/// What a file adds to a copy on the wire besides its path: its hash, its
+/// size and the length prefixes.
+const FILE_OVERHEAD: usize = 48;
+
+/// Cap on a mime type's length.
+const MAX_MIME_LEN: usize = 255;
+
+/// The clipboard of the whole mesh: the latest copy, or nothing once it
+/// was cleared or its lifetime ran out. Whichever has the newest stamp
+/// wins everywhere.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum Event {
-    /// Something was copied.
-    Copy(Copy),
-    /// Empty the clipboard everywhere, leaving the history alone.
-    Clear,
-    /// Drop one entry from every machine.
-    Forget(EntryId),
-    /// Drop every entry written before this one. What it covers is its
-    /// own place in the log, so a machine that has not caught up cannot
-    /// issue a purge that covers nothing.
-    Purge,
+pub struct Clip {
+    pub stamp: Stamp,
+    pub copy: Option<Copy>,
 }
 
 /// A copied selection.
@@ -45,9 +34,7 @@ pub struct Copy {
     /// Whether this is a password or the like: never written to disk,
     /// never shown, and given a lifetime by default.
     pub secret: bool,
-    /// Seconds after which every machine drops it and, if it is still on
-    /// the clipboard, empties the clipboard. `None` lets it live until the
-    /// history limits push it out.
+    /// Seconds after which every machine empties its clipboard of it.
     pub ttl: Option<u32>,
     /// The files this selection names, empty when it names none.
     ///
@@ -65,13 +52,13 @@ pub struct Copy {
 /// what lets a machine that did not do the copying answer that choice the
 /// way the source machine would have.
 ///
-/// The type that names the entry is a field of its own rather than the
+/// The type that names the selection is a field of its own rather than the
 /// head of a list, so it is always there: a selection with no
 /// representation is not a selection, and postcard refuses one on the way
 /// in rather than leaving every reader to wonder.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Selection {
-    /// What the entry *is*, and what it is named by in the history.
+    /// What the selection *is*.
     pub primary: Rep,
     /// The other types the same selection was offered under, best first.
     pub alternates: Vec<Rep>,
@@ -137,19 +124,9 @@ impl Selection {
             .unwrap_or_default()
     }
 
-    /// The type that describes the selection.
-    pub fn mime(&self) -> &str {
-        &self.primary.mime
-    }
-
     /// Every representation, best first.
     pub fn reps(&self) -> impl Iterator<Item = &Rep> {
         std::iter::once(&self.primary).chain(&self.alternates)
-    }
-
-    /// The same, giving them up.
-    pub fn into_reps(self) -> impl Iterator<Item = Rep> {
-        std::iter::once(self.primary).chain(self.alternates)
     }
 
     /// What the selection weighs: every representation together.
@@ -168,6 +145,68 @@ impl Copy {
     pub fn is_files(&self) -> bool {
         !self.files.is_empty()
     }
+
+    /// What the copy weighs on the wire: every representation, and the
+    /// manifest of the files it names.
+    pub fn size(&self) -> usize {
+        let manifest: usize = self
+            .files
+            .iter()
+            .map(|file| file.path.len() + FILE_OVERHEAD)
+            .sum();
+
+        self.selection.size() + manifest
+    }
+
+    /// Refuses a copy no machine should hold: too large for the wire, with
+    /// types a compositor would choke on, an unsafe manifest, or files on
+    /// a secret, which would write it to disk.
+    pub fn check(&self) -> eyre::Result<()> {
+        eyre::ensure!(self.size() <= MAX_SIZE as usize, "the copy is too large");
+        eyre::ensure!(
+            self.selection.reps().count() <= mime::MAX_REPS
+                && self.selection.reps().all(|rep| {
+                    !rep.mime.is_empty()
+                        && rep.mime.len() <= MAX_MIME_LEN
+                        && rep.mime.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+                }),
+            "the copy carries unusable types",
+        );
+        eyre::ensure!(
+            self.files.len() <= files::MAX_FILES,
+            "the copy names too many files"
+        );
+        eyre::ensure!(
+            !(self.secret && self.is_files()),
+            "a secret cannot name files"
+        );
+
+        files::validate(&self.files)
+    }
+
+    /// One line describing the copy, safe to print.
+    pub fn preview(&self) -> String {
+        let Rep { mime, bytes } = &self.selection.primary;
+        if self.secret {
+            return "<secret>".to_owned();
+        }
+        if !mime::is_text(mime) {
+            return format!("<{mime}, {}>", bytesize::ByteSize::b(bytes.len() as u64));
+        }
+
+        let text = String::from_utf8_lossy(bytes);
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut preview = crate::config::sanitize(lines.next().unwrap_or(""));
+        if let Some((cut, _)) = preview.char_indices().nth(PREVIEW_CHARS) {
+            preview.truncate(cut);
+            preview.push('…');
+        }
+        if lines.next().is_some() {
+            preview.push_str(" ⏎");
+        }
+
+        preview
+    }
 }
 
 impl Rep {
@@ -179,16 +218,10 @@ impl Rep {
     }
 }
 
-impl Event {
-    /// Encodes the event as a log payload.
-    pub fn encode(&self) -> Payload {
-        payload(postcard::to_stdvec(self).expect("a clipboard event must serialize"))
-    }
-
-    /// Decodes a log payload written by another machine, or read back from
-    /// disk.
-    pub fn decode(bytes: &[u8]) -> eyre::Result<Self> {
-        postcard::from_bytes(bytes).wrap_err("cannot decode the clipboard event")
+impl Drop for Rep {
+    /// Wipes the bytes: the clipboard is where a copied password lives.
+    fn drop(&mut self) {
+        self.bytes.zeroize();
     }
 }
 
@@ -197,39 +230,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn events_round_trip() {
-        let event = Event::Copy(Copy {
-            selection: Selection::new(vec![
-                Rep::new("text/plain", b"hello".to_vec()),
-                Rep::new("text/html", b"<b>hello</b>".to_vec()),
-            ])
-            .unwrap(),
-            secret: true,
-            ttl: Some(90),
-            files: Vec::new(),
-        });
-
-        let decoded = Event::decode(&event.encode()).unwrap();
-        let Event::Copy(copy) = decoded else {
-            panic!("expected a copy");
+    fn previews_are_one_safe_line() {
+        let preview = |mime: &str, bytes: &[u8], secret| {
+            Copy {
+                selection: Selection::of(Rep::new(mime, bytes.to_vec())),
+                secret,
+                ttl: None,
+                files: Vec::new(),
+            }
+            .preview()
         };
-        assert_eq!(copy.selection.mime(), "text/plain");
+
+        assert_eq!(preview("text/plain", b"one\ntwo", false), "one ⏎");
+        assert_eq!(preview("text/plain", b"a\x1b[2Kb", false), "a?[2Kb");
         assert_eq!(
-            copy.selection.rep("TEXT/HTML").unwrap().bytes,
-            b"<b>hello</b>",
+            preview("image/png", &[0; 2048], false),
+            "<image/png, 2.0 KiB>"
         );
-        assert_eq!(copy.selection.size(), 17);
-        assert!(copy.secret);
-        assert_eq!(copy.ttl, Some(90));
-    }
-
-    #[test]
-    fn a_selection_with_no_representation_cannot_be_built() {
-        assert!(Selection::new(Vec::new()).is_none());
-    }
-
-    #[test]
-    fn garbage_is_an_error_not_a_panic() {
-        assert!(Event::decode(&[0xff, 0xff, 0xff]).is_err());
+        assert_eq!(preview("text/plain", b"secret", true), "<secret>");
     }
 }

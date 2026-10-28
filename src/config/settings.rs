@@ -14,7 +14,7 @@ use bytesize::ByteSize;
 use eyre::WrapErr as _;
 use serde::Deserialize;
 
-use super::Dirs;
+use super::{Dirs, read_existing};
 
 /// Template written to a missing `config.toml`. Keys stay commented out:
 /// the file documents the defaults without freezing them.
@@ -34,21 +34,13 @@ const TEMPLATE: &str = r#"# yank configuration
 # Share what is copied on this machine with the others.
 #capture = true
 
-# How many entries the shared history keeps. One keeps nothing but what
-# is on the clipboard right now.
-#history-limit = 100
-
-# Largest single entry that gets shared, every type it is carried in
+# Largest selection that gets shared, every type it is carried in
 # together. The types that do not fit are dropped, best kept first, and a
 # selection whose first type is over on its own is not shared at all.
-# 4 MiB is as high as this goes: it is what one entry may weigh on the
-# wire.
-#max-entry-size = "1 MiB"
+# 4 MiB is as high as this goes: it is what a copy may weigh on the wire.
+#max-size = "1 MiB"
 
-# Total size the history may occupy; the oldest entries are dropped first.
-#history-budget = "64 MiB"
-
-# Lifetime given to an entry marked secret when none was asked for.
+# Lifetime given to a copy marked secret when none was asked for.
 #secret-ttl = "90s"
 
 # Mime types to never capture, on top of the ones yank already refuses.
@@ -62,9 +54,6 @@ const TEMPLATE: &str = r#"# yank configuration
 # Largest file copy that gets shared, every file of it together. A copy
 # over it is shared as text.
 #max-file-size = "1 GiB"
-
-# Total size the spooled files may occupy, on top of the history.
-#file-budget = "8 GiB"
 "#;
 
 /// The parsed `config.toml`.
@@ -78,19 +67,13 @@ const TEMPLATE: &str = r#"# yank configuration
 pub struct Settings {
     /// Whether to connect to a compositor at all.
     pub clipboard: bool,
-    /// Whether entries from other machines reach this clipboard.
+    /// Whether copies from other machines reach this clipboard.
     pub apply: bool,
     /// Whether this machine's clipboard is shared with the others.
     pub capture: bool,
-    /// How many entries the history keeps. Read it through
-    /// [`Self::history_entries`], which is where the floor of one is
-    /// enforced.
-    pub(crate) history_limit: usize,
-    /// Largest entry accepted, from the local clipboard or from a peer.
-    pub max_entry_size: ByteSize,
-    /// Total size the history may occupy.
-    pub history_budget: ByteSize,
-    /// Lifetime given to a secret entry when the caller asks for none.
+    /// Largest selection shared from this machine.
+    pub max_size: ByteSize,
+    /// Lifetime given to a secret copy when the caller asks for none.
     #[serde(deserialize_with = "duration")]
     pub secret_ttl: Duration,
     /// Mime types never captured, on top of what
@@ -99,17 +82,15 @@ pub struct Settings {
     /// of it (see [`crate::clip::Policy`]).
     ///
     /// The password-manager hint is how KeePassXC, 1Password and others
-    /// ask clipboard managers to leave an entry alone; yank honors it by
-    /// marking the entry secret rather than by dropping it (see
-    /// [`crate::clip`]), so it is not listed here.
+    /// ask clipboard managers to leave a selection alone; yank honors it by
+    /// marking the copy secret rather than by dropping it, so it is not
+    /// listed here.
     pub ignore_mime: Vec<String>,
     /// Whether a copied file is shared as its contents rather than as the
     /// text of its path.
     pub files: bool,
     /// Largest file copy shared, every file of it together.
     pub max_file_size: ByteSize,
-    /// Total size the spooled files may occupy.
-    pub file_budget: ByteSize,
 }
 
 impl Default for Settings {
@@ -118,14 +99,11 @@ impl Default for Settings {
             clipboard: true,
             apply: true,
             capture: true,
-            history_limit: 100,
-            max_entry_size: ByteSize::mib(1),
-            history_budget: ByteSize::mib(64),
+            max_size: ByteSize::mib(1),
             secret_ttl: Duration::from_secs(90),
             ignore_mime: Vec::new(),
             files: true,
             max_file_size: ByteSize::gib(1),
-            file_budget: ByteSize::gib(8),
         }
     }
 }
@@ -135,12 +113,8 @@ impl Settings {
     /// unreadable or invalid contents; the caller decides the fallback.
     pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.settings_file();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
-            }
+        let Some(text) = read_existing(&path, fs::read_to_string)? else {
+            return Ok(Self::default());
         };
 
         toml::from_str(&text).wrap_err_with(|| format!("cannot parse {}", path.display()))
@@ -165,27 +139,13 @@ impl Settings {
         }
     }
 
-    /// How many entries to keep, never below one: a history of zero
-    /// would drop every entry as it arrived, including the one on the
-    /// clipboard, which is not what anyone means by turning history off.
-    pub fn history_entries(&self) -> usize {
-        self.history_limit.max(1)
-    }
-
-    /// The size cap as a plain number, for comparisons against payloads.
-    ///
-    /// Never above the protocol ceiling: a larger setting would let a
-    /// selection past this check only to have the log refuse it, with an
-    /// error naming a limit the user never wrote.
-    pub fn max_entry_bytes(&self) -> usize {
-        usize::try_from(self.max_entry_size.as_u64())
+    /// The size cap as a plain number, never above the protocol ceiling:
+    /// a larger setting would let a selection past this check only to have
+    /// every peer refuse it.
+    pub fn max_bytes(&self) -> usize {
+        usize::try_from(self.max_size.as_u64())
             .unwrap_or(usize::MAX)
-            .min(crate::log::MAX_ENTRY_BYTES as usize)
-    }
-
-    /// The file cap as a plain number, for comparisons against a manifest.
-    pub fn max_file_bytes(&self) -> u64 {
-        self.max_file_size.as_u64()
+            .min(crate::clip::MAX_SIZE as usize)
     }
 }
 
@@ -214,29 +174,20 @@ mod tests {
 
     #[test]
     fn units_are_spelled_out() {
-        let settings = parse("max-entry-size = \"512 KiB\"\nsecret-ttl = \"2m\"");
-        assert_eq!(settings.max_entry_bytes(), 512 * 1024);
+        let settings = parse("max-size = \"512 KiB\"\nsecret-ttl = \"2m\"");
+        assert_eq!(settings.max_bytes(), 512 * 1024);
         assert_eq!(settings.secret_ttl, Duration::from_mins(2));
     }
 
     #[test]
-    fn an_entry_size_over_the_protocol_ceiling_is_clamped() {
-        let settings = parse("max-entry-size = \"1 GiB\"");
-        assert_eq!(
-            settings.max_entry_bytes(),
-            crate::log::MAX_ENTRY_BYTES as usize,
-        );
-    }
-
-    #[test]
-    fn the_history_always_keeps_the_current_entry() {
-        assert_eq!(parse("history-limit = 0").history_entries(), 1);
-        assert_eq!(parse("history-limit = 5").history_entries(), 5);
+    fn a_size_over_the_protocol_ceiling_is_clamped() {
+        let settings = parse("max-size = \"1 GiB\"");
+        assert_eq!(settings.max_bytes(), crate::clip::MAX_SIZE as usize);
     }
 
     #[test]
     fn unknown_keys_are_rejected() {
-        assert!(toml::from_str::<Settings>("histroy-limit = 10").is_err());
+        assert!(toml::from_str::<Settings>("max-szie = 10").is_err());
         assert!(toml::from_str::<Settings>("apply = \"yes\"").is_err());
     }
 

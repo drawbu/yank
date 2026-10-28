@@ -2,57 +2,60 @@
 //!
 //! Every change to who is in the mesh goes through [`MeshStore::update`],
 //! whether it came from the user over the control socket or from a peer's
-//! gossip: persist, commit in memory, tell the peer set to open or drop
-//! connections, and re-broadcast. Owning both the file and the peer set is
-//! what makes that ordering structural instead of a rule callers have to
-//! remember.
+//! gossip: persist, commit, and tell the peer set to open or drop
+//! connections before returning. Owning both the file and the peer set is
+//! what makes that ordering structural: a removed machine is cut off
+//! before the request removing it is answered. Every connection watches
+//! the state to gossip it on.
 
 use std::sync::{Arc, Mutex};
 
-use super::{hub::Hub, peers::PeerSet};
+use iroh::EndpointId;
+use tokio::sync::{mpsc, watch};
+
+use super::peers::PeerSet;
 use crate::{
     config::{Dirs, MeshState},
     net::pair,
 };
 
-/// The mesh state and everything a change to it has to reach.
+/// The mesh state, persisted and watched.
 #[derive(Debug)]
 pub struct MeshStore {
     dirs: Dirs,
-    state: Mutex<MeshState>,
+    /// This machine, whose own record gossip never overwrites.
+    local: EndpointId,
+    state: watch::Sender<MeshState>,
+    /// Held by a change from start to finish, so changes reach the disk
+    /// and the peer set in the order they were made. Apart from the state,
+    /// so readers do not wait on the disk.
+    writing: Mutex<()>,
     peers: Arc<PeerSet>,
-    hub: Arc<Hub>,
 }
 
 impl MeshStore {
-    /// Adopts the loaded state: publishes the membership before opening
-    /// any connection, so a peer cannot connect and be told the mesh is
-    /// empty.
-    pub fn new(dirs: Dirs, state: MeshState, peers: Arc<PeerSet>, hub: Arc<Hub>) -> Self {
-        hub.publish_membership(&state.membership());
-        peers.sync(&state);
+    /// Adopts the loaded state, opening a connection to every machine in
+    /// it.
+    pub fn new(
+        dirs: Dirs,
+        local: EndpointId,
+        state: watch::Sender<MeshState>,
+        peers: Arc<PeerSet>,
+    ) -> Self {
+        peers.sync(&state.borrow());
 
         MeshStore {
             dirs,
-            state: Mutex::new(state),
+            local,
+            state,
+            writing: Mutex::new(()),
             peers,
-            hub,
         }
     }
 
     /// A copy of the current state.
     pub fn snapshot(&self) -> MeshState {
-        self.state.lock().unwrap().clone()
-    }
-
-    /// Re-sends the membership unchanged.
-    ///
-    /// Gossip is not acknowledged and is only sent when something changes,
-    /// so a snapshot lost to a dropped stream would otherwise stay lost
-    /// until the next unrelated change. This is what heals it.
-    pub fn republish(&self) {
-        let state = self.state.lock().unwrap();
-        self.hub.publish_membership(&state.membership());
+        self.state.borrow().clone()
     }
 
     /// Registers a machine that just paired. Doing it twice is harmless,
@@ -67,32 +70,47 @@ impl MeshStore {
         })
     }
 
-    /// Changes the state: persist, commit, align the connections, and
-    /// broadcast when the membership moved.
+    /// Changes the state: persist, commit, and align the connections.
     ///
     /// Nothing is committed if the change or the save fails, and a change
-    /// that changes nothing writes and sends nothing, which is what stops
-    /// the gossip from echoing back and forth forever. The lock is held
-    /// across the whole thing on purpose, so concurrent changes reach the
-    /// peer set in the order they were committed.
+    /// that changes nothing writes and wakes nothing, which is what stops
+    /// the gossip from echoing back and forth forever.
     pub fn update<T>(
         &self,
         mutate: impl FnOnce(&mut MeshState) -> eyre::Result<T>,
     ) -> eyre::Result<T> {
-        let mut state = self.state.lock().unwrap();
+        let _writing = self.writing.lock().unwrap();
 
-        let mut next = state.clone();
+        let mut next = self.snapshot();
         let value = mutate(&mut next)?;
-        if next == *state {
+        if next == *self.state.borrow() {
             return Ok(value);
         }
-
         next.save(&self.dirs)?;
-        *state = next;
-
-        self.peers.sync(&state);
-        self.hub.publish_membership(&state.membership());
+        self.peers.sync(&next);
+        self.state.send_replace(next);
 
         Ok(value)
+    }
+
+    /// Merges the mesh states peers gossip, forever.
+    ///
+    /// One at a time, off a bounded queue: merging is fast, so a full
+    /// queue means a flood, and dropping is safe since the next change or
+    /// the periodic resend says it again.
+    pub async fn merge_gossip(self: Arc<Self>, mut gossip: mpsc::Receiver<MeshState>) {
+        while let Some(remote) = gossip.recv().await {
+            let store = self.clone();
+            let merged = tokio::task::spawn_blocking(move || {
+                store.update(|state| {
+                    state.merge(&remote, &store.local);
+                    Ok(())
+                })
+            })
+            .await;
+            if let Ok(Err(err)) = merged {
+                tracing::warn!("cannot apply a peer's mesh state: {err:#}");
+            }
+        }
     }
 }

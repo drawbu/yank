@@ -2,7 +2,7 @@
 //!
 //! Holds the iroh endpoint, the framing every protocol shares, the pairing
 //! exchange that lets a machine join the mesh, and the vocabulary machines
-//! use to replicate the log.
+//! use to replicate the clipboard.
 
 mod endpoint;
 pub mod pair;

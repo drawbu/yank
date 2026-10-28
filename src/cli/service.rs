@@ -5,8 +5,8 @@
 //!
 //! It is deliberately not tied to `graphical-session.target`. The daemon
 //! keeps replicating with no compositor in sight and reconnects when one
-//! appears, so binding it to the session would only make it miss the
-//! entries copied elsewhere while the screen was locked or the session was
+//! appears, so binding it to the session would only make it miss what was
+//! copied elsewhere while the screen was locked or the session was
 //! restarting.
 //!
 //! The unit is written here rather than by a service-manager crate: yank
@@ -24,24 +24,10 @@ use clap::{Args, Subcommand};
 use eyre::WrapErr as _;
 
 use super::ui;
-use crate::config::{Dirs, ServiceState};
+use crate::config::Dirs;
 
 /// Name of the unit this command writes.
 const UNIT: &str = "yank.service";
-
-/// Recorded as the installer, so a unit written here is recognizable as
-/// ours later (see [`ensure_ours`]).
-const LABEL: &str = "yank";
-
-/// Where systemd looks for user units that are not the user's own, in the
-/// order it searches them. A unit there belongs to whoever configured the
-/// system, and ours would shadow it rather than replace it.
-const SYSTEM_UNIT_DIRS: &[&str] = &[
-    "/etc/systemd/user",
-    "/run/systemd/user",
-    "/usr/local/lib/systemd/user",
-    "/usr/lib/systemd/user",
-];
 
 /// How long to let a restarted daemon settle before checking it is still
 /// there. `systemd` calls a `Type=simple` unit started as soon as the
@@ -84,67 +70,44 @@ enum ServiceCommand {
 }
 
 pub fn run(args: ServiceArgs, dirs: &Dirs) -> eyre::Result<()> {
-    let state = ServiceState::load(dirs)?;
-
     match args.command {
         ServiceCommand::Install { program } => {
-            ensure_ours(state.as_ref())?;
+            ensure_ours()?;
             install(dirs, program)
         }
         ServiceCommand::Uninstall => {
-            ensure_ours(state.as_ref())?;
-            uninstall(dirs)
+            ensure_ours()?;
+            uninstall()
         }
-        ServiceCommand::Start => {
-            systemctl(&["start", UNIT])?;
-            anstream::println!("{}", ui::good("Started"));
-            Ok(())
-        }
-        ServiceCommand::Stop => {
-            systemctl(&["stop", UNIT])?;
-            anstream::println!("{}", ui::good("Stopped"));
-            Ok(())
-        }
+        ServiceCommand::Start => switch("start", "Started"),
+        ServiceCommand::Stop => switch("stop", "Stopped"),
         ServiceCommand::Restart => restart(),
     }
 }
 
+/// Starts or stops the service.
+fn switch(verb: &str, done: &str) -> eyre::Result<()> {
+    systemctl(&[verb, UNIT])?;
+    anstream::println!("{}", ui::good(done));
+
+    Ok(())
+}
+
 /// Refuses to touch a service this command does not own.
 ///
-/// Three ways to not own one: the record names another installer, our own
-/// unit file is a symlink (how Nix installs one into the user's
-/// directory), or the system already provides a unit under the same name,
-/// which ours would shadow rather than replace.
-fn ensure_ours(state: Option<&ServiceState>) -> eyre::Result<()> {
-    if let Some(state) = state {
-        eyre::ensure!(
-            state.installer == ServiceState::CLI,
-            "the service is managed by {}: change that configuration instead",
-            state.installer,
-        );
+/// systemd says where it loads the unit from. Ours is the user's own unit
+/// file, as a plain file: a symlink there is how Home Manager installs
+/// one, and anywhere else is a unit written by whoever configured the
+/// system, which ours would shadow rather than replace.
+fn ensure_ours() -> eyre::Result<()> {
+    let ours = unit_path()?;
+    let loaded = systemctl(&["show", "--property=FragmentPath", "--value", UNIT])?;
 
-        return Ok(());
-    }
-
-    let path = unit_path()?;
     eyre::ensure!(
-        !path.is_symlink(),
-        "{} is a symlink, so something else manages the service: \
-         refusing to replace it",
-        path.display(),
+        loaded.is_empty() || (Path::new(&loaded) == ours && !ours.is_symlink()),
+        "{loaded} provides the service, so something else manages it: \
+         change that configuration instead",
     );
-
-    if let Some(system) = SYSTEM_UNIT_DIRS
-        .iter()
-        .map(|dir| Path::new(dir).join(UNIT))
-        .find(|path| path.exists())
-    {
-        eyre::bail!(
-            "{} already provides this service: installing would shadow it, \
-             not replace it. Change that configuration instead.",
-            system.display(),
-        );
-    }
 
     Ok(())
 }
@@ -163,9 +126,9 @@ fn install(dirs: &Dirs, program: Option<PathBuf>) -> eyre::Result<()> {
     // A custom directory has to be baked into the unit; the default one is
     // resolved by the daemon itself.
     let mut command = vec![quote(program.as_os_str())?];
-    if dirs.is_custom() {
+    if let Some(root) = dirs.root() {
         command.push("--dir".to_owned());
-        command.push(quote(dirs.config_root().as_os_str())?);
+        command.push(quote(root.as_os_str())?);
     }
     let path = unit_path()?;
     let parent = path.parent().expect("the unit path has a directory");
@@ -177,7 +140,6 @@ fn install(dirs: &Dirs, program: Option<PathBuf>) -> eyre::Result<()> {
     // systemd keeps serving the unit it cached until told otherwise, so a
     // reinstall would otherwise still run the old command line.
     systemctl(&["daemon-reload"])?;
-    ServiceState::record_cli(dirs, LABEL)?;
     systemctl(&["enable", "--now", UNIT])
         .wrap_err("wrote the unit, but cannot start the service")?;
 
@@ -188,7 +150,7 @@ fn install(dirs: &Dirs, program: Option<PathBuf>) -> eyre::Result<()> {
 }
 
 /// Stops the service and removes the unit.
-fn uninstall(dirs: &Dirs) -> eyre::Result<()> {
+fn uninstall() -> eyre::Result<()> {
     // Ignored: disabling a service that is not installed fails, and the
     // point here is to end up with it gone either way.
     let _ = systemctl(&["disable", "--now", UNIT]);
@@ -202,12 +164,11 @@ fn uninstall(dirs: &Dirs) -> eyre::Result<()> {
         }
     }
     systemctl(&["daemon-reload"])?;
-    ServiceState::clear(dirs)?;
 
     anstream::println!("{}", ui::good(format_args!("Removed {}", path.display())));
     anstream::println!(
         "{}",
-        ui::dim("The clipboard history and the paired machines are left alone."),
+        ui::dim("The clipboard and the paired machines are left alone."),
     );
 
     Ok(())
@@ -218,14 +179,9 @@ fn restart() -> eyre::Result<()> {
     systemctl(&["restart", UNIT])?;
     std::thread::sleep(SETTLE);
 
-    eyre::ensure!(
-        Command::new("systemctl")
-            .args(["--user", "is-active", "--quiet", UNIT])
-            .status()
-            .wrap_err("cannot run systemctl")?
-            .success(),
-        "the service started and then died; see `journalctl --user -u {UNIT}`",
-    );
+    systemctl(&["is-active", UNIT]).wrap_err_with(|| {
+        format!("the service started and then died; see `journalctl --user -u {UNIT}`")
+    })?;
     anstream::println!("{}", ui::good("Restarted"));
 
     Ok(())
@@ -249,7 +205,6 @@ fn unit(command: &str) -> String {
          ExecStart={command} daemon\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         Environment=RUST_LOG=yank=info\n\
          # The daemon holds clipboard contents, which may be passwords.\n\
          LimitCORE=0\n\
          NoNewPrivileges=true\n\
@@ -292,9 +247,9 @@ fn quote(arg: &OsStr) -> eyre::Result<String> {
     Ok(quoted)
 }
 
-/// Runs one `systemctl --user` command, reporting what it said when it
-/// fails.
-fn systemctl(args: &[&str]) -> eyre::Result<()> {
+/// Runs one `systemctl --user` command, returning what it printed, or
+/// reporting what it said when it fails.
+fn systemctl(args: &[&str]) -> eyre::Result<String> {
     let output = Command::new("systemctl")
         .arg("--user")
         .args(args)
@@ -310,7 +265,7 @@ fn systemctl(args: &[&str]) -> eyre::Result<()> {
         );
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Where the user's own units live.

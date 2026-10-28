@@ -1,5 +1,6 @@
 //! Command-line interface.
 
+mod client;
 mod clip;
 mod daemon;
 mod pause;
@@ -12,13 +13,14 @@ use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 
+pub use self::client::ask;
 use crate::config::Dirs;
 
 /// A peer-to-peer clipboard daemon
 ///
-/// Replicates the clipboard, and a bounded history of it, across the
-/// machines you own. They pair once and connect directly from then on,
-/// with no server in between.
+/// Replicates the clipboard across the machines you own: whatever was
+/// copied last, anywhere, is on every clipboard. They pair once and
+/// connect directly from then on, with no server in between.
 ///
 /// Getting started:
 ///   1. Install the background service:  yank service install
@@ -45,21 +47,19 @@ enum Command {
     Copy(clip::CopyArgs),
     Paste(clip::PasteArgs),
     Get(clip::GetArgs),
-    #[command(visible_alias = "history")]
-    List(clip::ListArgs),
-    Pick(clip::PickArgs),
-    #[command(visible_alias = "remove")]
-    Rm(clip::RmArgs),
-    Clear(clip::ClearArgs),
+    /// Empty the clipboard on every machine
+    Clear,
     Pause(pause::PauseArgs),
     Resume(pause::ResumeArgs),
-    Status(status::StatusArgs),
+    /// Show the machines, the clipboard and the daemon
+    Status,
     Peer(peer::PeerArgs),
     Service(service::ServiceArgs),
+    /// Run the daemon in the foreground
     // Hidden: this is what the installed service runs. Users manage the
     // daemon through `yank service`.
     #[command(hide = true)]
-    Daemon(daemon::DaemonArgs),
+    Daemon,
 }
 
 /// Runs the command line.
@@ -76,16 +76,13 @@ pub fn run() -> eyre::Result<()> {
         Command::Copy(args) => clip::copy(args, &dirs),
         Command::Paste(args) => clip::paste(&args, &dirs),
         Command::Get(args) => clip::get(&args, &dirs),
-        Command::List(args) => clip::list(&args, &dirs),
-        Command::Pick(args) => clip::pick(args, &dirs),
-        Command::Rm(args) => clip::rm(args, &dirs),
-        Command::Clear(args) => clip::clear(&args, &dirs),
+        Command::Clear => clip::clear(&dirs),
         Command::Pause(args) => pause::pause(&args, &dirs),
         Command::Resume(args) => pause::resume(&args, &dirs),
-        Command::Status(args) => status::run(&args, &dirs),
+        Command::Status => status::run(&dirs),
         Command::Peer(args) => peer::run(args, &dirs),
         Command::Service(args) => service::run(args, &dirs),
-        Command::Daemon(args) => daemon::run(&args, &dirs),
+        Command::Daemon => daemon::run(&dirs),
     }
 }
 
@@ -97,8 +94,8 @@ pub fn run() -> eyre::Result<()> {
 pub enum Situation {
     #[error("The yank daemon is not running. Start it with `yank service start`.")]
     DaemonNotRunning,
-    #[error("The files of {label} have not arrived; the daemon is still trying.")]
-    FilesPending { label: String },
+    #[error("The files have not arrived; the daemon is still trying.")]
+    FilesPending,
 }
 
 impl Situation {
@@ -108,7 +105,7 @@ impl Situation {
 
         match self {
             Situation::DaemonNotRunning => ExitCode::from(EX_UNAVAILABLE),
-            Situation::FilesPending { .. } => ExitCode::from(EX_TEMPFAIL),
+            Situation::FilesPending => ExitCode::from(EX_TEMPFAIL),
         }
     }
 }
@@ -124,7 +121,7 @@ pub fn report_error(err: &eyre::Report) -> ExitCode {
     code
 }
 
-fn parse_duration(text: &str) -> eyre::Result<Duration, String> {
+fn parse_duration(text: &str) -> Result<Duration, String> {
     humantime::parse_duration(text).map_err(|err| err.to_string())
 }
 

@@ -4,33 +4,24 @@
 //!
 //! - `$XDG_CONFIG_HOME/yank/config.toml`: the only hand-edited file, read
 //!   once when the daemon starts.
-//! - `$XDG_CONFIG_HOME/yank/service.toml`: which program installed the
-//!   background service, written by `yank service install` or by an
-//!   external manager such as the Nix module.
 //! - `$XDG_STATE_HOME/yank/identity.key`: this machine's private identity
 //!   on the mesh. Only the daemon ever reads it.
 //! - `$XDG_STATE_HOME/yank/mesh.json`: the paired machines. The daemon is
 //!   the sole writer; the CLI mutates it through the control socket.
-//! - `$XDG_STATE_HOME/yank/clip.json` and `history/`: see [`crate::clip`].
+//! - `$XDG_STATE_HOME/yank/clip.bin`: the clipboard and the pause, as last
+//!   saved, secrets left out.
+//! - `$XDG_STATE_HOME/yank/files/`: the spool of copied files, see
+//!   [`crate::files`].
 //! - `$XDG_RUNTIME_DIR/yank.sock`: the control socket.
-//!
-//! It also owns what is not on disk but belongs to the same environment:
-//! the graphical session as the systemd user manager sees it.
 
 mod dirs;
 mod key;
 mod mesh;
 mod name;
-mod service;
-#[cfg(target_os = "linux")]
-mod session;
 mod settings;
 
-pub use dirs::{Dirs, create_private, write_private};
+pub use dirs::{Dirs, create_private, read_existing, write_private};
 pub use key::MachineKey;
-pub use mesh::{MAX_MESH_PEERS, Membership, MeshState, Peer, PeerStatus};
+pub use mesh::{MAX_MESH_PEERS, MeshState, Peer, PeerStatus};
 pub use name::{MAX_NAME_LEN, sanitize, sanitize_bounded, validate_name};
-pub use service::ServiceState;
-#[cfg(target_os = "linux")]
-pub use session::wayland_socket;
 pub use settings::Settings;

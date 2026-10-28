@@ -7,40 +7,38 @@
 //! ```text
 //!   compositor ──► captured ─┐
 //!   CLI (socket) ──► copy ───┼─► Clipboard ──► effects ──► disk
-//!   peers ────────► accept ──┘        │                └─► compositor
-//!                                     └─► announce ────────► peers
+//!   peers ────────► accept ──┘       │                 ├─► compositor
+//!                                    │                 └─► file service
+//!                                    └─► head ──► peers
 //! ```
 //!
 //! It also runs the two things that happen without anyone asking: dropping
-//! entries whose lifetime has run out, and reconnecting to the compositor
+//! a copy whose lifetime has run out, and reconnecting to the compositor
 //! after the session goes away and comes back.
 
 use std::{
     collections::BTreeSet,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
 use eyre::WrapErr as _;
 use iroh::EndpointId;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use super::{
     backoff::Backoff,
-    files::{Job, Spool},
-    hub::Hub,
+    control::ClipInfo,
+    files::{Job, Jobs},
 };
 use crate::{
     clip::{
-        Backend as _, Captured, Clipboard, Effect, Item, Pause, Policy, Rep, Selection, Switch,
+        Captured, Clip, Clipboard, Effect, Pause, Policy, Rep, Saved, Selection, Stamp, Switch,
         backend::{self, Command, Platform},
     },
-    config::{Dirs, Settings, write_private},
+    config::{Dirs, Settings, read_existing, write_private},
     files::{FileRef, Hash},
-    log::{self, Checkpoint, EntryId, Log, Watermark, WireEntry},
-    net::proto::Topic,
 };
 
 /// First delay before reconnecting to the compositor.
@@ -51,26 +49,9 @@ const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// How often the service loop wakes with nothing due. It is what catches
-/// the things no event announces: a wall clock that jumped over an entry's
+/// the things no event announces: a wall clock that jumped over a
 /// lifetime, and a `yank pause --for` whose time is up.
 const EXPIRY_FLOOR: Duration = Duration::from_mins(1);
-
-/// The state kept outside the log: where our own numbering is up to, and
-/// which directions the user paused.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Persisted {
-    checkpoint: Checkpoint,
-    pause: Pause,
-}
-
-/// Why the clipboard is not being read right now.
-#[derive(Clone, Debug)]
-pub enum BackendState {
-    Running,
-    /// No compositor or compatible data-control protocol is available.
-    Down(String),
-}
 
 /// The clipboard, everything it writes to, and everyone it tells.
 #[derive(Debug)]
@@ -78,157 +59,130 @@ pub struct ClipService {
     dirs: Dirs,
     settings: Arc<Settings>,
     board: Mutex<Clipboard>,
-    writer: log::Writer,
-    backend: Mutex<Option<Platform>>,
-    down: Mutex<Option<String>>,
-    hub: Arc<Hub>,
-    /// Where a copied file's contents go, and where the ones an entry
-    /// names are asked for.
-    spool: Spool,
+    /// The compositor connection, or why there is none.
+    backend: Mutex<Result<Platform, String>>,
+    /// The stamp of the clip, for the peers to announce.
+    head: watch::Sender<Option<Stamp>>,
+    /// The file service: where a copied file's contents go, and where the
+    /// ones a clip names are asked for.
+    jobs: Jobs,
     /// Woken when the state changed in a way the service loop cares about:
     /// a new lifetime to wait for, or a pause that was lifted.
     wake: Notify,
-    /// Woken when an entry's files have been laid out here, for whoever is
-    /// waiting on one.
+    /// Woken when a clip's files have been laid out here, for whoever is
+    /// waiting on them.
     arrived: Notify,
 }
 
-/// Where an entry's files are.
+/// Where the clip's files are.
 #[derive(Debug)]
 pub struct Located {
-    pub id: EntryId,
-    pub files: Arc<[FileRef]>,
+    pub files: Vec<FileRef>,
     /// The tree they are laid out in, `None` while they are still on their
     /// way.
     pub tree: Option<PathBuf>,
 }
 
 impl ClipService {
-    /// Loads the history from disk and starts the service. `identity` is
-    /// this machine's endpoint id, which the log writes its entries under.
+    /// Loads the saved clip and starts the service. `identity` is this
+    /// machine's endpoint id, which its copies are stamped with.
     pub fn open(
         dirs: &Dirs,
         identity: EndpointId,
         settings: Arc<Settings>,
-        hub: Arc<Hub>,
-        spool: Spool,
+        jobs: Jobs,
     ) -> eyre::Result<Arc<Self>> {
-        let persisted = load_persisted(dirs)?;
-        let history = dirs.history_dir();
-
-        let mut board = Clipboard::new(
-            Log::new(identity, Clipboard::limits(&settings), persisted.checkpoint),
-            settings.clone(),
-            persisted.pause,
-        );
-        let dropped = board.restore(log::Writer::load(&history)?);
+        let board = Clipboard::new(identity, settings.clone(), load(dirs)?);
+        let head = watch::Sender::new(board.head());
 
         let service = Arc::new(ClipService {
             dirs: dirs.clone(),
             settings,
             board: Mutex::new(board),
-            writer: log::Writer::spawn(history)?,
-            backend: Mutex::new(None),
-            down: Mutex::new(Some("starting".to_owned())),
-            hub,
-            spool,
+            backend: Mutex::new(Err("starting".to_owned())),
+            head,
+            jobs,
             wake: Notify::new(),
             arrived: Notify::new(),
         });
-        // Files the caps or a replayed removal dropped as the history was
-        // read back. They hold clipboard contents in plain text, so they
-        // go now rather than at some later cleanup.
-        service.perform(dropped);
+        // What expired while the daemon was down leaves the disk now.
+        service.change(|_| vec![Effect::Save]);
 
         Ok(service)
     }
 
-    /// What this machine holds, for the announcements.
-    pub fn have(&self) -> Watermark {
-        self.board.lock().unwrap().have()
+    /// The stamp of the clip.
+    pub fn head(&self) -> Option<Stamp> {
+        self.board.lock().unwrap().head()
     }
 
-    /// The entries a peer at `want` is missing.
-    pub fn since(&self, want: &Watermark) -> Vec<WireEntry> {
-        self.board.lock().unwrap().since(want)
+    /// The stamp of the clip, now and on every change.
+    pub fn subscribe(&self) -> watch::Receiver<Option<Stamp>> {
+        self.head.subscribe()
     }
 
-    /// Takes a batch of entries from a peer.
-    pub fn accept(&self, entries: Vec<WireEntry>) -> eyre::Result<()> {
-        let effects = self.board.lock().unwrap().accept(entries)?;
-        self.perform(effects);
+    /// The clip, for a peer that asked for it.
+    pub fn clip(&self) -> Option<Arc<Clip>> {
+        self.board.lock().unwrap().clip().cloned()
+    }
 
-        Ok(())
+    /// Takes a clip from a peer.
+    pub fn accept(&self, clip: Clip) -> eyre::Result<()> {
+        self.try_change(|board| board.accept(clip))
     }
 
     /// Copies something from this machine.
-    pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> eyre::Result<EntryId> {
-        let (id, effects) =
-            self.board
-                .lock()
-                .unwrap()
-                .copy(Selection::of(rep), Vec::new(), secret, ttl)?;
-        self.perform(effects);
-
-        Ok(id)
+    pub fn copy(&self, rep: Rep, secret: bool, ttl: Option<Duration>) -> eyre::Result<()> {
+        self.try_change(|board| board.copy(Selection::of(rep), Vec::new(), secret, ttl))
     }
 
     /// Copies files from this machine: their contents are spooled first,
-    /// so the entry never names what this machine cannot serve.
+    /// so the clip never names what this machine cannot serve.
     ///
     /// What goes on the clipboard is the paths, the way a file manager
     /// offers them. Pasting it here is pasting the originals; pasting it
     /// on another machine is pasting the copies that land there.
-    pub async fn copy_files(
-        self: &Arc<Self>,
-        paths: Vec<PathBuf>,
-        ttl: Option<Duration>,
-    ) -> eyre::Result<EntryId> {
+    pub async fn copy_files(&self, paths: Vec<PathBuf>, ttl: Option<Duration>) -> eyre::Result<()> {
         eyre::ensure!(
             self.settings.files,
             "sharing files is turned off in config.toml",
         );
 
-        let service = self.clone();
-        let spooled = paths.clone();
-        let files = tokio::task::spawn_blocking(move || {
-            super::files::take_all(&service.spool.store, &spooled, &service.settings)
-        })
-        .await
-        .wrap_err("the spool task failed")??;
-
-        let reserved = files.clone();
-        let copied =
-            self.board
-                .lock()
-                .unwrap()
-                .copy(Selection::of_files(&paths), files, false, ttl);
-        self.spool.store.release(&reserved);
-        let (id, effects) = copied?;
-        self.perform(effects);
-
-        Ok(id)
+        let (done, copied) = oneshot::channel();
+        self.jobs.send(Job::Copy { paths, ttl, done });
+        copied.await.wrap_err("the file service is gone")?
     }
 
-    /// Where an entry's files are, asking for them when they are not here
+    /// Copies files the file service took into the spool.
+    pub fn copy_spooled(
+        &self,
+        paths: &[PathBuf],
+        files: Vec<FileRef>,
+        ttl: Option<Duration>,
+    ) -> eyre::Result<()> {
+        self.try_change(|board| board.copy(Selection::of_files(paths), files, false, ttl))
+    }
+
+    /// Where the clip's files are, asking for them when they are not here
     /// and waiting up to `within` for them to arrive.
     ///
     /// The wait is the point: a transfer takes as long as the files are
     /// large, and a caller polling for the answer would ask hundreds of
     /// times to be told the same thing. Past the deadline the answer says
     /// they are not here; the fetch carries on regardless.
-    pub async fn located(&self, needle: Option<&str>, within: Duration) -> eyre::Result<Located> {
-        let (id, files) = {
+    pub async fn located(&self, within: Duration) -> eyre::Result<Located> {
+        let (stamp, files) = {
             let board = self.board.lock().unwrap();
-            let id = board.named(needle)?.id;
-            let files = board.files(id);
-            eyre::ensure!(!files.is_empty(), "entry {id} names no file");
+            let (stamp, copy) = board
+                .current()
+                .ok_or_else(|| eyre::eyre!("the clipboard is empty"))?;
+            eyre::ensure!(copy.is_files(), "the clipboard names no file");
             eyre::ensure!(
-                !board.is_local(id),
-                "entry {id} was copied here; its files are where they always were",
+                !board.is_ours(),
+                "the files were copied here; they are where they always were",
             );
 
-            (id, files)
+            (stamp, copy.files.clone())
         };
 
         let deadline = Instant::now() + within;
@@ -239,99 +193,105 @@ impl ClipService {
             tokio::pin!(arrived);
             arrived.as_mut().enable();
 
-            let tree = self.board.lock().unwrap().tree(id).map(Path::to_path_buf);
+            let tree = {
+                let board = self.board.lock().unwrap();
+                eyre::ensure!(
+                    board.head() == Some(stamp),
+                    "the clipboard changed meanwhile"
+                );
+                board.tree().map(PathBuf::from)
+            };
             if tree.is_some() {
-                return Ok(Located { id, files, tree });
+                return Ok(Located { files, tree });
             }
-            // Fetching happens when an entry reaches the clipboard, so an
-            // older one has to be asked for; never once its files are
-            // here, since a fetch lays the tree out again and rebuilding
-            // one somebody is reading is how a paste finds half of it.
-            self.spool.send(Job::Fetch(id));
+            // Asked again in case an earlier fetch gave up; never once the
+            // files are here, since a fetch lays the tree out again and
+            // rebuilding one somebody is reading is how a paste finds half
+            // of it.
+            self.jobs.send(Job::Fetch(stamp));
 
             let left = deadline.saturating_duration_since(Instant::now());
             if tokio::time::timeout(left, arrived).await.is_err() {
-                return Ok(Located {
-                    id,
-                    files,
-                    tree: None,
-                });
+                return Ok(Located { files, tree: None });
             }
         }
     }
 
     /// Records a selection the compositor reported, with the files it
-    /// named once they are spooled.
-    pub fn record(&self, captured: Captured, files: Vec<FileRef>) {
-        let recorded = self.board.lock().unwrap().captured(captured, files);
-        match recorded {
-            Ok(effects) => self.perform(effects),
-            Err(err) => tracing::warn!("cannot record the selection: {err:#}"),
-        }
+    /// named once they are spooled. Dropped when the clip moved on since
+    /// `base` was read: spooling takes time, and a copy made elsewhere
+    /// meanwhile is the later one.
+    pub fn record(&self, base: Option<Stamp>, captured: Captured, files: Vec<FileRef>) {
+        self.change(|board| {
+            if board.head() == base {
+                board.captured(captured, files)
+            } else {
+                Vec::new()
+            }
+        });
     }
 
-    /// Records that an entry's files are on this machine now.
-    pub fn materialized(&self, id: EntryId, tree: PathBuf) {
-        let effects = self.board.lock().unwrap().materialized(id, tree);
-        self.perform(effects);
+    /// Records that the files of the clip stamped `stamp` are here now.
+    pub fn materialized(&self, stamp: Stamp, tree: PathBuf) {
+        self.change(|board| board.materialized(stamp, tree));
         self.arrived.notify_waiters();
     }
 
-    /// The files an entry names.
-    pub fn files(&self, id: EntryId) -> Arc<[FileRef]> {
-        self.board.lock().unwrap().files(id)
-    }
-
-    /// What the spool may keep: the entries the history still holds, and
-    /// the content they name.
-    pub fn referenced(&self) -> (BTreeSet<EntryId>, BTreeSet<Hash>) {
-        self.board.lock().unwrap().referenced()
-    }
-
-    /// Makes an entry already in the history the selection again.
-    pub fn pick(&self, needle: &str) -> eyre::Result<EntryId> {
-        let mut board = self.board.lock().unwrap();
-        let id = board.resolve(needle)?.id;
-        let (picked, effects) = board.pick(id)?;
-        drop(board);
-        self.perform(effects);
-
-        Ok(picked)
-    }
-
-    /// One representation of an entry: the selection when none is named,
-    /// and its best type when none is asked for.
-    ///
-    /// Returns the type of the bytes, and the other types the entry
-    /// carries.
-    pub fn paste(
-        &self,
-        needle: Option<&str>,
-        mime: Option<&str>,
-    ) -> eyre::Result<(String, Vec<String>, Vec<u8>)> {
+    /// The files the clip stamped `stamp` names, while it is the clip and
+    /// they are not laid out here: laying them out again would pull the
+    /// tree from under a paste reading it.
+    pub fn wanted(&self, stamp: Stamp) -> Vec<FileRef> {
         let board = self.board.lock().unwrap();
-        let id = board.named(needle)?.id;
-        let copy = board.body(id)?;
+        match board.current() {
+            Some((current, copy)) if current == stamp && board.tree().is_none() => {
+                copy.files.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the spool may keep: the clip's tree, and the content it names.
+    pub fn referenced(&self) -> (Option<Stamp>, BTreeSet<Hash>) {
+        let board = self.board.lock().unwrap();
+        match board.current() {
+            Some((stamp, copy)) => (
+                Some(stamp),
+                copy.files.iter().map(|file| file.hash).collect(),
+            ),
+            None => (None, BTreeSet::new()),
+        }
+    }
+
+    /// One representation of the clipboard, its best type when none is
+    /// asked for.
+    ///
+    /// Returns the type of the bytes, and the other types it carries.
+    pub fn paste(&self, mime: Option<&str>) -> eyre::Result<(String, Vec<String>, Vec<u8>)> {
+        let board = self.board.lock().unwrap();
+        let selection = &board
+            .current()
+            .ok_or_else(|| eyre::eyre!("the clipboard is empty"))?
+            .1
+            .selection;
 
         let rep = match mime {
-            Some(mime) => copy.selection.rep(mime).ok_or_else(|| {
+            Some(mime) => selection.rep(mime).ok_or_else(|| {
                 eyre::eyre!(
-                    "entry {id} has no {} in it; it has {}",
+                    "the clipboard has no {} in it; it has {}",
                     crate::config::sanitize(mime),
-                    copy.selection
+                    selection
                         .reps()
                         .map(|rep| rep.mime.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
                 )
             })?,
-            None => &copy.selection.primary,
+            None => &selection.primary,
         };
         // Compared by where they sit rather than by name: the type asked
         // for is matched case-insensitively, so `--type TEXT/HTML` would
         // otherwise list `text/html` as an alternative to itself.
-        let alternates = copy
-            .selection
+        let alternates = selection
             .reps()
             .filter(|other| !std::ptr::eq(*other, rep))
             .map(|other| other.mime.clone())
@@ -340,134 +300,175 @@ impl ClipService {
         Ok((rep.mime.clone(), alternates, rep.bytes.clone()))
     }
 
-    /// Drops one entry from every machine.
-    pub fn forget(&self, needle: &str) -> eyre::Result<EntryId> {
-        let mut board = self.board.lock().unwrap();
-        let id = board.resolve(needle)?.id;
-        let effects = board.forget(id)?;
-        drop(board);
-        self.perform(effects);
-
-        Ok(id)
-    }
-
-    /// Empties the clipboard everywhere, and the history too when asked.
-    pub fn clear(&self, history: bool) -> eyre::Result<()> {
-        let mut board = self.board.lock().unwrap();
-        let mut effects = board.clear()?;
-        if history {
-            effects.extend(board.purge()?);
-        }
-        drop(board);
-        self.perform(effects);
-
-        Ok(())
+    /// Empties the clipboard everywhere.
+    pub fn clear(&self) {
+        self.change(Clipboard::clear);
     }
 
     /// Pauses or resumes a direction of the clipboard.
-    pub fn set_pause(&self, capture: Option<Switch>, apply: Option<Switch>) -> eyre::Result<Pause> {
-        let mut board = self.board.lock().unwrap();
-        let effects = board.set_pause(capture, apply);
-        let pause = board.pause();
-        drop(board);
+    pub fn set_pause(&self, capture: Option<Switch>, apply: Option<Switch>) -> Pause {
+        self.change(|board| board.set_pause(capture, apply));
 
-        self.perform(effects);
-        self.persist()?;
-        self.wake.notify_one();
-
-        Ok(pause)
+        self.pause()
     }
 
-    /// The history, newest first, and which entry is the selection.
-    pub fn history(&self) -> (Vec<Item>, Option<EntryId>) {
+    /// What the clipboard holds, for `yank status`. `name` names the
+    /// machine it was copied on.
+    pub fn describe(&self, name: impl Fn(EndpointId) -> String) -> Option<ClipInfo> {
         let board = self.board.lock().unwrap();
-        let selected = board.selection().map(|item| item.id);
-        let items = board.history().into_iter().cloned().collect();
+        let (stamp, copy) = board.current()?;
+        let now = SystemTime::now();
 
-        (items, selected)
+        Some(ClipInfo {
+            preview: copy.preview(),
+            secret: copy.secret,
+            files: copy.files.len(),
+            origin: name(stamp.origin),
+            age_secs: now
+                .duration_since(stamp.time())
+                .unwrap_or_default()
+                .as_secs(),
+            expires_in_secs: board
+                .expires_at()
+                .map(|at| at.duration_since(now).unwrap_or_default().as_secs()),
+        })
     }
 
-    /// Which directions are running.
     pub fn pause(&self) -> Pause {
         self.board.lock().unwrap().pause()
     }
 
-    /// Whether the compositor side is running, and why not when it is not.
-    pub fn backend_state(&self) -> BackendState {
-        match self.down.lock().unwrap().clone() {
-            Some(reason) => BackendState::Down(reason),
-            None => BackendState::Running,
-        }
+    /// Why the compositor side is not running, `None` when it is.
+    pub fn backend_down(&self) -> Option<String> {
+        self.backend.lock().unwrap().as_ref().err().cloned()
     }
 
-    /// Performs what a mutation asked for, then tells the peers.
+    /// Runs a mutation and performs what it asked for.
+    fn change(&self, mutate: impl FnOnce(&mut Clipboard) -> Vec<Effect>) {
+        let _ = self.try_change(|board| Ok(mutate(board)));
+    }
+
+    /// The same, for a mutation that may refuse.
     ///
-    /// Nothing is sent for a mutation that changed nothing, which is what
-    /// keeps an idle mesh silent.
-    fn perform(&self, effects: Vec<Effect>) {
+    /// The effects are performed under the lock, so two mutations racing
+    /// reach the compositor, the disk and the peers in the order they
+    /// happened.
+    fn try_change(
+        &self,
+        mutate: impl FnOnce(&mut Clipboard) -> eyre::Result<Vec<Effect>>,
+    ) -> eyre::Result<()> {
+        let mut board = self.board.lock().unwrap();
+        let effects = mutate(&mut board)?;
         if effects.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let mut forgot = false;
         for effect in effects {
             match effect {
-                Effect::Store(entry) => self.writer.store(&entry),
-                Effect::Forget(id) => {
-                    self.writer.forget(id);
-                    forgot = true;
+                Effect::Save => {
+                    if let Err(err) = self.save(&board) {
+                        tracing::warn!("cannot save the clipboard: {err:#}");
+                    }
+                    // The files of a clip that was replaced go with it.
+                    self.jobs.send(Job::Sweep);
                 }
-                Effect::Apply(serves) => self.to_backend(Command::Offer(serves)),
-                Effect::ClearSelection => self.to_backend(Command::Clear),
-                Effect::Fetch(id) => self.spool.send(Job::Fetch(id)),
+                Effect::Backend(command) => self.to_backend(command),
+                Effect::Fetch(stamp) => self.jobs.send(Job::Fetch(stamp)),
             }
         }
-        // An entry that went takes its files with it. Swept rather than
-        // deleted one by one: the same content may be named by another
-        // entry, and only the whole history knows.
-        if forgot {
-            self.spool.send(Job::Sweep);
-        }
-
-        if let Err(err) = self.persist() {
-            tracing::warn!("cannot save the clipboard state: {err:#}");
-        }
-        self.hub.announce(Topic::Clipboard, self.have());
+        self.head.send_if_modified(|head| {
+            let changed = *head != board.head();
+            *head = board.head();
+            changed
+        });
         self.wake.notify_one();
+
+        Ok(())
     }
 
     /// Hands a command to the compositor, if there is one.
     fn to_backend(&self, command: Command) {
-        if let Some(backend) = &*self.backend.lock().unwrap() {
+        if let Ok(backend) = &*self.backend.lock().unwrap() {
             backend.send(command);
         } else {
-            tracing::debug!("no clipboard backend; dropping {command:?}");
+            tracing::debug!("no clipboard backend; dropping a command");
         }
     }
 
-    /// Writes the sequence, clock and pause state.
-    ///
-    /// A few hundred bytes, at most once per clipboard event, written and
-    /// renamed into place. Losing it would make this machine reuse entry
-    /// numbers it already used, which every other machine would then
-    /// ignore as already seen.
-    fn persist(&self) -> eyre::Result<()> {
-        let board = self.board.lock().unwrap();
-        let persisted = Persisted {
-            checkpoint: board.checkpoint(),
-            pause: board.pause(),
-        };
-        drop(board);
+    fn save(&self, board: &Clipboard) -> eyre::Result<()> {
+        let bytes = postcard::to_stdvec(&board.saved()).expect("the clipboard must serialize");
 
-        let bytes = serde_json::to_vec_pretty(&persisted).expect("clip state must serialize");
         write_private(&self.dirs.clip_file(), &bytes)
+    }
+
+    /// Connects to the compositor.
+    ///
+    /// Connecting means a round trip to the compositor, which is a
+    /// blocking call on a process that may be busy or wedged, so it does
+    /// not run on the async runtime.
+    async fn connect_backend(
+        &self,
+        events: &mpsc::UnboundedSender<backend::Event>,
+    ) -> eyre::Result<()> {
+        let events = events.clone();
+        let policy = Policy {
+            max_bytes: self.settings.max_bytes(),
+            ignore: self.settings.ignore_mime.clone(),
+        };
+        let socket = backend::locate().await;
+        let backend =
+            tokio::task::spawn_blocking(move || backend::connect(&events, policy, socket))
+                .await
+                .wrap_err("the clipboard connection task failed")?
+                .wrap_err("cannot read the clipboard")?;
+
+        self.set_backend(Ok(backend));
+        tracing::info!("clipboard connected");
+
+        Ok(())
+    }
+
+    /// Handles one event from the compositor. Returns whether the backend
+    /// has to be reconnected.
+    fn on_backend_event(&self, event: backend::Event) -> bool {
+        match event {
+            backend::Event::Copied(captured) => {
+                // A selection that names files is recorded by the file
+                // service instead, once their contents are spooled: a
+                // clip must never name content this machine cannot serve.
+                // A secret is the exception, since spooling is a write to
+                // disk and a secret never touches one.
+                let paths = if self.settings.files && !captured.secret {
+                    captured.selection.file_paths()
+                } else {
+                    Vec::new()
+                };
+                self.jobs.send(Job::Record {
+                    base: self.head(),
+                    captured: Box::new(captured),
+                    paths,
+                });
+                false
+            }
+            backend::Event::Lost(reason) => {
+                tracing::warn!("clipboard disconnected: {reason}");
+                self.set_backend(Err(reason));
+                true
+            }
+        }
+    }
+
+    fn set_backend(&self, backend: Result<Platform, String>) {
+        let previous = std::mem::replace(&mut *self.backend.lock().unwrap(), backend);
+        // Out of the lock: dropping a backend waits for its thread.
+        drop(previous);
     }
 }
 
 /// Runs the clipboard service until the daemon stops.
 ///
 /// Holds the connection to the compositor, reconnecting when the session
-/// goes away, and drops entries as their lifetimes run out.
+/// goes away, and drops the copy when its lifetime runs out.
 pub async fn run(service: Arc<ClipService>) {
     let (events, mut inbox) = mpsc::unbounded_channel();
     let mut backoff = Backoff::new(RECONNECT_MIN, RECONNECT_MAX);
@@ -477,7 +478,7 @@ pub async fn run(service: Arc<ClipService>) {
     // retrying forever on a server would be noise, and the daemon is
     // useful there anyway, as somewhere to paste from.
     if !service.settings.clipboard {
-        service.mark_down("turned off in config.toml");
+        service.set_backend(Err("turned off in config.toml".to_owned()));
         reconnect_at = None;
     }
 
@@ -489,7 +490,7 @@ pub async fn run(service: Arc<ClipService>) {
                     None
                 }
                 Err(err) => {
-                    service.mark_down(&format!("{err:#}"));
+                    service.set_backend(Err(format!("{err:#}")));
                     Some(Instant::now() + backoff.next_delay())
                 }
             };
@@ -511,93 +512,20 @@ pub async fn run(service: Arc<ClipService>) {
             () = service.wake.notified() => {}
         }
 
-        let effects = service.board.lock().unwrap().expire(SystemTime::now());
-        service.perform(effects);
+        service.change(|board| board.expire(SystemTime::now()));
     }
 }
 
-impl ClipService {
-    /// Connects to the compositor.
-    ///
-    /// Connecting means a round trip to the compositor, which is a
-    /// blocking call on a process that may be busy or wedged, so it does
-    /// not run on the async runtime.
-    async fn connect_backend(
-        &self,
-        events: &mpsc::UnboundedSender<backend::Event>,
-    ) -> eyre::Result<()> {
-        let events = events.clone();
-        let policy = Policy {
-            max_bytes: self.settings.max_entry_bytes(),
-            ignore: self.settings.ignore_mime.clone(),
-        };
-        let socket = backend::locate().await;
-        let backend =
-            tokio::task::spawn_blocking(move || backend::connect(&events, policy, socket))
-                .await
-                .wrap_err("the clipboard connection task failed")?
-                .wrap_err("cannot read the clipboard")?;
-
-        *self.backend.lock().unwrap() = Some(backend);
-        *self.down.lock().unwrap() = None;
-        tracing::info!("clipboard connected");
-
-        Ok(())
-    }
-
-    /// Handles one event from the compositor. Returns whether the backend
-    /// has to be reconnected.
-    fn on_backend_event(&self, event: backend::Event) -> bool {
-        match event {
-            backend::Event::Copied(captured) => {
-                // A selection that names files is recorded by the file
-                // service instead, once their contents are spooled: an
-                // entry must never name content this machine cannot serve.
-                // A secret is the exception, since spooling is a write to
-                // disk and a secret never touches one.
-                let paths = if self.settings.files && !captured.secret {
-                    captured.selection.file_paths()
-                } else {
-                    Vec::new()
-                };
-                if paths.is_empty() {
-                    self.spool.send(Job::Record(captured));
-                } else {
-                    self.spool.send(Job::Snapshot {
-                        captured: Box::new(captured),
-                        paths,
-                    });
-                }
-                false
-            }
-            backend::Event::Lost(reason) => {
-                tracing::warn!("clipboard disconnected: {reason}");
-                // Taken out of the lock before it is dropped: dropping a
-                // backend waits for its thread.
-                let backend = self.backend.lock().unwrap().take();
-                drop(backend);
-
-                self.mark_down(&reason);
-                true
-            }
-        }
-    }
-
-    fn mark_down(&self, reason: &str) {
-        *self.down.lock().unwrap() = Some(reason.to_owned());
-    }
-}
-
-/// How long the service loop may sleep: until the next lifetime runs out,
-/// the next reconnection attempt, or a minute, whichever comes first.
+/// How long the service loop may sleep: until the lifetime runs out, the
+/// next reconnection attempt, or a minute, whichever comes first.
 fn next_wake(service: &ClipService, reconnect_at: Option<Instant>) -> Duration {
     // A deadline already in the past means no sleep at all, not a full
-    // floor's wait: the entry is due now.
+    // floor's wait: the copy is due now.
     let expiry = service
         .board
         .lock()
         .unwrap()
-        .next_expiry()
+        .expires_at()
         .map_or(EXPIRY_FLOOR, |deadline| {
             deadline
                 .duration_since(SystemTime::now())
@@ -610,19 +538,25 @@ fn next_wake(service: &ClipService, reconnect_at: Option<Instant>) -> Duration {
     expiry.min(reconnect).min(EXPIRY_FLOOR)
 }
 
-/// Reads `clip.json`, treating a missing or unreadable file as empty: it
-/// costs the entry numbering a restart, not the daemon.
-fn load_persisted(dirs: &Dirs) -> eyre::Result<Persisted> {
+/// Reads the saved clipboard. An unreadable one costs the clip, not the
+/// daemon.
+fn load(dirs: &Dirs) -> eyre::Result<Saved> {
     let path = dirs.clip_file();
-    match std::fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(persisted) => Ok(persisted),
-            Err(err) => {
-                tracing::warn!("cannot read {}: {err}", path.display());
-                Ok(Persisted::default())
-            }
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Persisted::default()),
-        Err(err) => Err(err).wrap_err_with(|| format!("cannot read {}", path.display())),
+    let Some(bytes) = read_existing(&path, std::fs::read)? else {
+        return Ok(Saved::default());
+    };
+
+    // A file another version wrote may decode into something else
+    // entirely; leftover bytes are what gives it away.
+    match postcard::take_from_bytes::<Saved>(&bytes) {
+        Ok((saved, [])) => Ok(saved),
+        Ok(_) => {
+            tracing::warn!("{} has trailing bytes; starting empty", path.display());
+            Ok(Saved::default())
+        }
+        Err(err) => {
+            tracing::warn!("cannot read {}: {err}; starting empty", path.display());
+            Ok(Saved::default())
+        }
     }
 }

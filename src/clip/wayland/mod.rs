@@ -21,6 +21,7 @@
 //! thread rather than the whole clipboard.
 
 pub(crate) mod protocol;
+mod session;
 
 use std::{
     collections::HashMap,
@@ -46,9 +47,10 @@ use wayland_client::{
 };
 
 use self::protocol::{Device, DeviceEvent, Manager, Offer, Source, SourceEvent};
+pub use self::session::session_socket;
 use super::{
-    backend::{self, Captured, Command, Event, Policy, Serve},
-    event::{Rep, Selection},
+    Rep, Selection,
+    backend::{Captured, Command, Event, Policy, Serve},
     mime,
 };
 
@@ -121,9 +123,9 @@ impl Wayland {
     }
 }
 
-impl backend::Backend for Wayland {
+impl Wayland {
     /// Queues a command, waking the backend thread to run it.
-    fn send(&self, command: Command) {
+    pub fn send(&self, command: Command) {
         let Some(commands) = &self.commands else {
             return;
         };
@@ -398,7 +400,7 @@ impl State {
 
                 // Our own selection comes back to us as an event like any
                 // other; the marker is what tells them apart, and without
-                // it every machine would copy every entry back.
+                // it every machine would share every clip back.
                 if mimes.iter().any(|mime| mime == mime::MARKER) {
                     return;
                 }
@@ -416,8 +418,8 @@ impl State {
                 });
             }
             // Nobody owns the selection now, which is not something the
-            // daemon acts on: an empty clipboard is not a reason to put an
-            // entry back on it (see [`crate::clip::state`]).
+            // daemon acts on: an empty clipboard is not a reason to put the
+            // clip back on it (see [`crate::clip::state`]).
             DeviceEvent::Selection(None) => self.forget_stale_offers(),
             DeviceEvent::Finished => self.alive = false,
         }
@@ -616,7 +618,7 @@ fn read_selection(pipes: Vec<(String, OwnedFd)>, budget: usize) -> Vec<Rep> {
         }
     }
 
-    // The first type is what the entry *is*, so a selection that did not
+    // The first type is what the selection *is*, so a selection that did not
     // arrive under it is not this selection at all.
     if !reading.first().is_some_and(|entry| entry.whole) {
         return Vec::new();

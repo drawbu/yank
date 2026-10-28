@@ -5,7 +5,7 @@
 //! terminal or `NO_COLOR` is set. Commands go through the wrappers below
 //! rather than styling by hand, so the palette stays in one place.
 //!
-//! Machine names and entry previews are cleaned up at the daemon boundary
+//! Machine names and clipboard previews are cleaned up at the daemon boundary
 //! and print as they are; anything else coming from a peer or the daemon
 //! has to pass through [`crate::config::sanitize`] first.
 

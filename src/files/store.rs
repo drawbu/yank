@@ -1,9 +1,9 @@
-//! The spool: content by hash, and the trees entries are laid out in.
+//! The spool: content by hash, and the tree the clip is laid out in.
 //!
 //! ```text
 //!   files/blobs/<hash>          the bytes, named by what they are
 //!   files/blobs/<hash>.part     a transfer that has not finished
-//!   files/trees/<entry>/<path>  hard links, under the names of the copy
+//!   files/trees/<stamp>/<path>  hard links, under the names of the copy
 //! ```
 //!
 //! Two views of one thing. Content is addressed by hash so a file already
@@ -17,45 +17,39 @@
 //! links, and nothing should: a paste reads them.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::{self, File},
-    io::{self, Seek as _, SeekFrom, Write as _},
+    io::{self, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
 use eyre::WrapErr as _;
 use walkdir::WalkDir;
 
 use super::{FileRef, Hash};
-use crate::{config::create_private, log::EntryId};
+use crate::{clip::Stamp, config::create_private};
 
 /// What a transfer that has not finished is named after the content it
 /// will become.
 const PARTIAL: &str = ".part";
 
-/// Prefix of a file being copied into the spool, before it is named by
-/// what it turned out to be. A sweep leaves these alone: one of them may
-/// be a copy in progress, and unlinking it would fail the copy.
-const TAKING: &str = "taking-";
-
-/// A file to take into the spool: where it is now, the name it keeps, and
-/// what it weighed when the selection was walked.
+/// A file to take into the spool: where it is now, and the name it keeps.
 #[derive(Clone, Debug)]
 pub struct Source {
     pub from: PathBuf,
     pub path: String,
-    pub size: u64,
 }
 
 /// The spool of one machine.
+///
+/// Taking a file in and sweeping are not safe against each other: a sweep
+/// drops what no clip names yet. The file service runs both, one at a
+/// time.
 #[derive(Debug)]
 pub struct Store {
     blobs: PathBuf,
     trees: PathBuf,
-    /// Hashes copied into the spool before their manifest reaches the log.
-    pending: Mutex<BTreeMap<Hash, usize>>,
 }
 
 /// A transfer being written, verified as it goes.
@@ -64,7 +58,8 @@ pub struct Incoming {
     hash: Hash,
     path: PathBuf,
     file: File,
-    written: u64,
+    /// Everything written so far, the part resumed included.
+    hasher: blake3::Hasher,
 }
 
 impl Store {
@@ -73,21 +68,9 @@ impl Store {
         let store = Store {
             blobs: root.join("blobs"),
             trees: root.join("trees"),
-            pending: Mutex::default(),
         };
         create_private(&store.blobs)?;
         create_private(&store.trees)?;
-        // Nothing can be in the middle of being taken before the daemon
-        // starts, so whatever is left is from one that died.
-        for path in read_dir(&store.blobs)? {
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(TAKING))
-            {
-                let _ = fs::remove_file(&path);
-            }
-        }
 
         Ok(store)
     }
@@ -102,26 +85,16 @@ impl Store {
         self.blob(hash).is_file()
     }
 
-    /// Where an entry's files are laid out.
-    pub fn tree(&self, id: EntryId) -> PathBuf {
-        self.trees.join(id.label())
+    /// Where the files of the clip stamped `stamp` are laid out.
+    pub fn tree(&self, stamp: Stamp) -> PathBuf {
+        self.trees.join(stamp.to_string())
     }
 
-    /// Takes a snapshot of a file into the spool without reserving it against a sweep.
+    /// Takes a snapshot of a file into the spool.
     pub fn take(&self, source: &Path) -> eyre::Result<(Hash, u64)> {
-        self.take_inner(source, false)
-    }
-
-    /// Takes a file into the spool and keeps it safe from a concurrent
-    /// sweep until [`Self::release`] publishes its manifest.
-    pub fn take_reserved(&self, source: &Path) -> eyre::Result<(Hash, u64)> {
-        self.take_inner(source, true)
-    }
-
-    fn take_inner(&self, source: &Path, reserve: bool) -> eyre::Result<(Hash, u64)> {
         let tmp = self
             .blobs
-            .join(format!("{TAKING}{:016x}", rand::random::<u64>()));
+            .join(format!("taking-{:016x}", rand::random::<u64>()));
         let taken = clone_file(source, &tmp).and_then(|()| hash_file(&tmp));
         let (hash, size) = match taken {
             Ok(taken) => taken,
@@ -131,37 +104,34 @@ impl Store {
             }
         };
 
-        // A sweep holds this lock while deciding what to remove. Reserving
-        // before the blob is made visible closes the gap before its manifest
-        // enters the history.
-        let mut pending = self.pending.lock().unwrap();
         let blob = self.blob(hash);
         if blob.is_file() {
-            // Some other entry already named these bytes.
+            // Some other copy already named these bytes.
             let _ = fs::remove_file(&tmp);
         } else {
             fs::rename(&tmp, &blob)
                 .wrap_err_with(|| format!("cannot spool {}", source.display()))?;
         }
-        if reserve {
-            *pending.entry(hash).or_default() += 1;
-        }
 
         Ok((hash, size))
     }
 
-    /// Allows blobs named by a newly recorded manifest to be swept again.
-    pub fn release(&self, files: &[FileRef]) {
-        let mut pending = self.pending.lock().unwrap();
-        for file in files {
-            let count = pending
-                .get_mut(&file.hash)
-                .expect("only reserved blobs are released");
-            *count -= 1;
-            if *count == 0 {
-                pending.remove(&file.hash);
+    /// How much of a transfer for `hash`, a file of `size` bytes, is
+    /// already here. One that grew past it holds the wrong bytes, and goes.
+    pub fn partial(&self, hash: Hash, size: u64) -> u64 {
+        let path = self.partial_path(hash);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() <= size => meta.len(),
+            Ok(_) => {
+                let _ = fs::remove_file(&path);
+                0
             }
+            Err(_) => 0,
         }
+    }
+
+    fn partial_path(&self, hash: Hash) -> PathBuf {
+        self.blobs.join(format!("{}{PARTIAL}", hash.file_name()))
     }
 
     /// Opens a transfer for `hash`, resuming a partial one.
@@ -169,7 +139,7 @@ impl Store {
     /// What is already on disk is hashed back in, so the verification at
     /// the end covers the whole file and not only what this run wrote.
     pub fn receive(&self, hash: Hash) -> eyre::Result<Incoming> {
-        let path = self.blobs.join(format!("{}{PARTIAL}", hash.file_name()));
+        let path = self.partial_path(hash);
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -177,22 +147,25 @@ impl Store {
             .truncate(false)
             .open(&path)
             .wrap_err_with(|| format!("cannot open {}", path.display()))?;
-        let written = file.seek(SeekFrom::End(0))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher
+            .update_reader(&mut file)
+            .wrap_err_with(|| format!("cannot read {}", path.display()))?;
 
         Ok(Incoming {
             hash,
             path,
             file,
-            written,
+            hasher,
         })
     }
 
-    /// Lays an entry's files out as a tree of links into the spool.
+    /// Lays a clip's files out as a tree of links into the spool.
     ///
-    /// The tree is rebuilt rather than patched: it belongs to one entry,
-    /// and an entry is written once.
-    pub fn lay_out(&self, id: EntryId, files: &[FileRef]) -> eyre::Result<PathBuf> {
-        let tree = self.tree(id);
+    /// The tree is rebuilt rather than patched: it belongs to one clip,
+    /// and a clip is written once.
+    pub fn lay_out(&self, stamp: Stamp, files: &[FileRef]) -> eyre::Result<PathBuf> {
+        let tree = self.tree(stamp);
         remove_tree(&tree);
         create_private(&tree)?;
 
@@ -209,35 +182,27 @@ impl Store {
         Ok(tree)
     }
 
-    /// Drops everything no live entry names: the trees of entries that are
-    /// gone, the content nothing points at, and transfers abandoned when
-    /// the entry that wanted them went away.
-    pub fn sweep(&self, entries: &BTreeSet<EntryId>, content: &BTreeSet<Hash>) -> eyre::Result<()> {
-        let live: BTreeSet<String> = entries.iter().map(EntryId::label).collect();
+    /// Drops everything the clip stamped `live` does not name: the trees
+    /// of other clips, the content nothing points at, and transfers
+    /// abandoned when the clip that wanted them was replaced.
+    pub fn sweep(&self, live: Option<Stamp>, content: &BTreeSet<Hash>) -> eyre::Result<()> {
+        let live = live.map(|stamp| self.tree(stamp));
         for tree in read_dir(&self.trees)? {
-            if !tree
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| live.contains(name))
-            {
-                tracing::debug!("dropping the files of a gone entry: {}", tree.display());
+            if live.as_ref() != Some(&tree) {
+                tracing::debug!("dropping the files of a gone clip: {}", tree.display());
                 remove_tree(&tree);
             }
         }
 
-        let pending = self.pending.lock().unwrap();
         for blob in read_dir(&self.blobs)? {
             let name = blob.file_name().and_then(|name| name.to_str());
-            if name.is_some_and(|name| name.starts_with(TAKING)) {
-                continue;
-            }
             // Read back as the hash the name says it is, so a partial
             // transfer is swept by the same rule as the content it will
             // become, and a name that is neither goes as the junk it is.
             let named = name
                 .map(|name| name.strip_suffix(PARTIAL).unwrap_or(name))
                 .and_then(Hash::parse);
-            if !named.is_some_and(|hash| content.contains(&hash) || pending.contains_key(&hash)) {
+            if !named.is_some_and(|hash| content.contains(&hash)) {
                 tracing::debug!("dropping unreferenced content: {}", blob.display());
                 let _ = fs::remove_file(&blob);
             }
@@ -245,23 +210,13 @@ impl Store {
 
         Ok(())
     }
-
-    /// What the spool weighs, transfers in progress included.
-    pub fn size(&self) -> u64 {
-        read_dir(&self.blobs)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|blob| fs::metadata(blob).ok())
-            .map(|meta| meta.len())
-            .sum()
-    }
 }
 
 impl Incoming {
     /// How much of the content is already here, and where a peer should
     /// carry on from.
     pub fn at(&self) -> u64 {
-        self.written
+        self.hasher.count()
     }
 
     /// Appends what arrived.
@@ -269,7 +224,7 @@ impl Incoming {
         self.file
             .write_all(bytes)
             .wrap_err_with(|| format!("cannot write {}", self.path.display()))?;
-        self.written += bytes.len() as u64;
+        self.hasher.update(bytes);
 
         Ok(())
     }
@@ -281,8 +236,7 @@ impl Incoming {
     pub fn finish(self, store: &Store) -> eyre::Result<()> {
         drop(self.file);
 
-        let (hash, _) = hash_file(&self.path)?;
-        if hash != self.hash {
+        if Hash::from(self.hasher.finalize()) != self.hash {
             let _ = fs::remove_file(&self.path);
             eyre::bail!("the content of {} is not what it was named", self.hash);
         }
@@ -347,7 +301,6 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> eyre::Result
             found.push(Source {
                 from: entry.path().to_owned(),
                 path: path.to_owned(),
-                size,
             });
         }
     }
@@ -422,6 +375,13 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
 
         (dir, store)
+    }
+
+    fn stamp(millis: u64) -> Stamp {
+        Stamp {
+            millis,
+            origin: iroh::SecretKey::generate().public(),
+        }
     }
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
@@ -503,11 +463,7 @@ mod tests {
                 hash: two.0,
             },
         ];
-        let id = EntryId {
-            origin: iroh::SecretKey::generate().public(),
-            seq: 1,
-        };
-        let tree = store.lay_out(id, &files).unwrap();
+        let tree = store.lay_out(stamp(1), &files).unwrap();
 
         assert_eq!(fs::read(tree.join("a.txt")).unwrap(), b"first");
         assert_eq!(fs::read(tree.join("photos/b.txt")).unwrap(), b"second");
@@ -516,27 +472,22 @@ mod tests {
     #[test]
     fn a_path_from_a_peer_is_never_followed_out_of_the_tree() {
         let (_dir, store) = store();
-        let id = EntryId {
-            origin: iroh::SecretKey::generate().public(),
-            seq: 1,
-        };
         let files = vec![FileRef {
             path: "../escaped".to_owned(),
             size: 0,
             hash: Hash::of(b""),
         }];
 
-        assert!(store.lay_out(id, &files).is_err());
+        assert!(store.lay_out(stamp(1), &files).is_err());
     }
 
     #[test]
-    fn sweeping_keeps_what_the_history_still_names() {
+    fn sweeping_keeps_what_the_clip_names() {
         let (dir, store) = store();
-        let origin = iroh::SecretKey::generate().public();
         let kept = store.take(&write(dir.path(), "kept", b"kept")).unwrap().0;
         let gone = store.take(&write(dir.path(), "gone", b"gone")).unwrap().0;
 
-        let live = EntryId { origin, seq: 1 };
+        let live = stamp(1);
         store
             .lay_out(
                 live,
@@ -547,36 +498,14 @@ mod tests {
                 }],
             )
             .unwrap();
-        store.lay_out(EntryId { origin, seq: 2 }, &[]).unwrap();
+        store.lay_out(stamp(2), &[]).unwrap();
 
-        store
-            .sweep(&BTreeSet::from([live]), &BTreeSet::from([kept]))
-            .unwrap();
+        store.sweep(Some(live), &BTreeSet::from([kept])).unwrap();
 
         assert!(store.has(kept));
         assert!(!store.has(gone));
         assert!(store.tree(live).is_dir());
-        assert!(!store.tree(EntryId { origin, seq: 2 }).exists());
-    }
-
-    #[test]
-    fn a_reserved_blob_survives_until_its_manifest_is_published() {
-        let (dir, store) = store();
-        let (hash, size) = store
-            .take_reserved(&write(dir.path(), "kept", b"kept"))
-            .unwrap();
-        let files = [FileRef {
-            path: "kept".to_owned(),
-            size,
-            hash,
-        }];
-
-        store.sweep(&BTreeSet::new(), &BTreeSet::new()).unwrap();
-        assert!(store.has(hash));
-
-        store.release(&files);
-        store.sweep(&BTreeSet::new(), &BTreeSet::new()).unwrap();
-        assert!(!store.has(hash));
+        assert!(!store.tree(stamp(2)).exists());
     }
 
     #[test]

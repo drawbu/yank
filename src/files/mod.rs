@@ -7,18 +7,18 @@
 //! different file. yank turns the reference into content:
 //!
 //! ```text
-//!   copy   paths ──► spool, one file per hash ──► manifest in the entry
+//!   copy   paths ──► spool, one file per hash ──► manifest in the clip
 //!   paste  manifest ──► fetch the hashes from a peer ──► tree of links
 //!                                                    └─► text/uri-list
 //! ```
 //!
-//! The manifest is small and rides the log like any other entry, so every
-//! machine knows what an entry names as soon as it hears of it. The bytes
-//! do not: they are named by hash, pulled from whoever has them
-//! ([`crate::net::proto::ContentRequest`]) and never enter the log.
+//! The manifest is small and rides the clip, so every machine knows what
+//! it names as soon as it hears of it. The bytes do not: they are named by
+//! hash, and pulled from whoever has them
+//! ([`crate::net::proto::ContentRequest`]).
 //!
 //! [`Store`] owns both halves of the spool: content by hash, and the tree
-//! of hard links an entry is laid out as, which is what a `file://` URI on
+//! of hard links the clip is laid out as, which is what a `file://` URI on
 //! a machine that did not do the copying points at.
 
 mod store;
@@ -34,7 +34,7 @@ use data_encoding::HEXLOWER;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 use serde::{Deserialize, Serialize};
 
-pub use self::store::{Source, Store, walk};
+pub use self::store::{Incoming, Source, Store, walk};
 
 /// What a `file:` URI may carry unescaped: the unreserved characters of
 /// RFC 3986, and the separator between path components. Everything else,
@@ -47,10 +47,14 @@ const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~')
     .remove(b'/');
 
+/// How many files one clip may name. A folder is walked, and a deep one is
+/// a manifest a clip cannot carry.
+pub const MAX_FILES: usize = 4096;
+
 /// The name of some content: the blake3 hash of the bytes.
 ///
-/// Content-addressed rather than named, so a file already spooled under
-/// another entry is never fetched twice, and so a transfer that ends with
+/// Content-addressed rather than named, so a file already spooled is never
+/// fetched twice, and so a transfer that ends with
 /// the wrong bytes is caught by the name it was asked for.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Hash([u8; 32]);
@@ -58,7 +62,7 @@ pub struct Hash([u8; 32]);
 /// One file a selection names.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRef {
-    /// Where the file sits under the entry's root: `photos/a.png`. Always
+    /// Where the file sits under the clip's root: `photos/a.png`. Always
     /// relative, and never climbing out of it (see [`Self::is_safe`]); it
     /// is a path a peer wrote, and it is used to create files.
     pub path: String,
@@ -122,12 +126,10 @@ impl FileRef {
 }
 
 /// What a selection of files weighs.
-pub fn total(files: &[FileRef]) -> eyre::Result<u64> {
-    files.iter().try_fold(0u64, |total, file| {
-        total
-            .checked_add(file.size)
-            .ok_or_else(|| eyre::eyre!("the file manifest is too large"))
-    })
+pub fn total(files: &[FileRef]) -> u64 {
+    files
+        .iter()
+        .fold(0, |total, file| total.saturating_add(file.size))
 }
 
 /// Checks the manifest before it drives disk or network work.
@@ -147,7 +149,6 @@ pub fn validate(files: &[FileRef]) -> eyre::Result<()> {
         }),
         "two files would occupy the same path",
     );
-    total(files)?;
     Ok(())
 }
 

@@ -4,17 +4,13 @@
 //! must never be shared between machines; the public half is the endpoint
 //! id peers dial. Stored base64-encoded, owner-readable only.
 
-use std::{
-    fs,
-    io::{self, Write as _},
-    path::Path,
-};
+use std::{fs, io::Write as _, path::Path};
 
 use data_encoding::BASE64;
 use eyre::WrapErr as _;
 use iroh::{EndpointId, SecretKey};
 
-use super::Dirs;
+use super::{Dirs, read_existing};
 
 /// The machine's secret identity key.
 #[derive(Clone, Debug)]
@@ -25,10 +21,9 @@ impl MachineKey {
     pub fn load(dirs: &Dirs) -> eyre::Result<Self> {
         let path = dirs.identity_file();
 
-        match fs::read_to_string(&path) {
-            Ok(content) => Self::decode(&content),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::generate(&path),
-            Err(err) => Err(err).wrap_err_with(|| format!("cannot read {}", path.display())),
+        match read_existing(&path, fs::read_to_string)? {
+            Some(content) => Self::decode(&content),
+            None => Self::generate(&path),
         }
     }
 

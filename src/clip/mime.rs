@@ -9,14 +9,14 @@
 
 /// The type yank adds to every selection it owns.
 ///
-/// It is how the daemon recognizes its own selection: applying an entry
+/// It is how the daemon recognizes its own selection: applying a clip
 /// makes the compositor announce a new selection, and without a marker
 /// that announcement is indistinguishable from the user copying something,
-/// which would append a duplicate entry on every machine, forever.
+/// which would share it back to every machine.
 pub const MARKER: &str = "application/x-yank";
 
 /// What password managers offer alongside a password so clipboard managers
-/// leave it alone. yank does not drop such an entry, since the point is to
+/// leave it alone. yank does not drop such a selection, since the point is to
 /// paste it on another machine, but treats it as secret: memory only, and
 /// gone after the configured lifetime.
 pub const SECRET_HINT: &str = "x-kde-passwordManagerHint";
@@ -32,7 +32,7 @@ pub const PLAIN_TEXT: &str = "text/plain;charset=utf-8";
 /// selection from costing a pipe, a thread and a Wayland request per type
 /// an application feels like advertising, and there is no upper bound on
 /// how many that is.
-const MAX_REPS: usize = 8;
+pub const MAX_REPS: usize = 8;
 
 /// The type a file reference is carried as: `file://` URIs, one per line.
 pub const URI_LIST: &str = "text/uri-list";
@@ -75,7 +75,7 @@ const CHATTER: &[&str] = &[
 
 /// Picks the types to capture out of what a selection offers, best first.
 ///
-/// The first is what the entry is: text when there is text, because text
+/// The first is what the selection is: text when there is text, because text
 /// is what a shared clipboard is mostly for and what every machine can
 /// serve back; failing that, the first offered type that carries content
 /// at all. The rest is everything else offered, so a pasting application
@@ -114,7 +114,7 @@ pub fn select<'a>(offered: &'a [String], ignore: &[String]) -> Vec<&'a str> {
     chosen
 }
 
-/// The type that describes a selection: the one an entry is named by.
+/// The type that describes a selection.
 fn choose(offered: &[String]) -> Option<&str> {
     best_text(offered).or_else(|| {
         offered
@@ -234,7 +234,7 @@ mod tests {
     }
 
     /// An image, with the text an application offers beside it. Text is
-    /// what the entry is named by, as always, and the image is carried
+    /// what the selection is named by, as always, and the image is carried
     /// with it rather than instead of it.
     #[test]
     fn an_image_is_carried_beside_the_text() {

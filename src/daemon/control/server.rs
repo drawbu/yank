@@ -1,8 +1,7 @@
 //! The daemon's side of the control socket.
 //!
 //! Binding the socket is also the single-daemon guard: two daemons sharing
-//! one identity would race each other's connections, and two sharing one
-//! history would each renumber it.
+//! one identity would race each other's connections.
 
 use std::{
     fs::{self, File, TryLockError},
@@ -16,15 +15,13 @@ use iroh::Endpoint;
 use tokio::net::{UnixListener, UnixStream};
 
 use super::protocol::{
-    ClipboardStatus, FILES_WAIT, FileInfo, HistoryEntry, MAX_MESSAGE_SIZE, Request, Response,
-    Status,
+    ClipboardStatus, FILES_WAIT, MAX_MESSAGE_SIZE, PAIRING_TIMEOUT, Request, Response, Status,
 };
 use crate::{
-    clip::{Item, Rep},
+    clip::Rep,
     config::{Dirs, sanitize_bounded},
     daemon::{
-        backoff::Backoff, clip::BackendState, pairing::Pairing, peers::PeerSet, store::MeshStore,
-        topics::Topics,
+        backoff::Backoff, clip::ClipService, pairing::Pairing, peers::PeerSet, store::MeshStore,
     },
     net::{pair, wire::read_message, wire::write_message},
 };
@@ -32,9 +29,6 @@ use crate::{
 /// Budget for reading a request, so a client that connects and says
 /// nothing does not hold a task.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Budget for a whole pairing, from dialing to the confirmation.
-const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// First and last delay between retries when accepting fails.
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(100);
@@ -46,7 +40,7 @@ pub struct Context {
     pub endpoint: Endpoint,
     pub started: SystemTime,
     pub peers: Arc<PeerSet>,
-    pub topics: Arc<Topics>,
+    pub clip: Arc<ClipService>,
     pub store: Arc<MeshStore>,
     pub pairing: Arc<Pairing>,
 }
@@ -150,18 +144,18 @@ async fn handle(mut stream: UnixStream, ctx: Arc<Context>) {
 
 /// Runs one request.
 async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
-    let clip = &ctx.topics.clipboard;
+    let clip = &ctx.clip;
 
     match request {
         Request::Status => Ok(Response::Status(Box::new(status(ctx)))),
         Request::PairHost { name } => {
-            crate::config::validate_name("machine", &name)?;
+            crate::config::validate_name(&name)?;
             Ok(Response::PairTicket(
                 ctx.pairing.host(name).await?.to_string(),
             ))
         }
         Request::PairJoin { ticket, name } => {
-            crate::config::validate_name("machine", &name)?;
+            crate::config::validate_name(&name)?;
             let ticket: pair::PairTicket = ticket.parse()?;
             let state = ctx.store.snapshot();
 
@@ -171,10 +165,7 @@ async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
                 .map_err(|_| eyre::eyre!("pairing timed out"))??;
             ctx.store.add_paired(&peer)?;
 
-            Ok(Response::Paired {
-                name: peer.name,
-                endpoint: peer.endpoint,
-            })
+            Ok(Response::Paired(peer.name))
         }
         Request::RemovePeer { peer } => {
             let id = ctx.store.snapshot().resolve_peer(&peer)?;
@@ -186,39 +177,28 @@ async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
             mime,
             bytes,
             secret,
-            ttl_secs,
+            ttl,
         } => {
-            let ttl = ttl_secs.map(Duration::from_secs);
-            let id = clip.copy(Rep::new(mime, bytes), secret, ttl)?;
+            clip.copy(Rep::new(mime, bytes), secret, ttl)?;
 
-            Ok(Response::Wrote { label: id.label() })
+            Ok(Response::Done)
         }
-        Request::CopyFiles { paths, ttl_secs } => {
-            let paths = paths.into_iter().map(std::path::PathBuf::from).collect();
-            let id = clip
-                .copy_files(paths, ttl_secs.map(Duration::from_secs))
-                .await?;
+        Request::CopyFiles { paths, ttl } => {
+            let paths = paths.into_iter().map(PathBuf::from).collect();
+            clip.copy_files(paths, ttl).await?;
 
-            Ok(Response::Wrote { label: id.label() })
+            Ok(Response::Done)
         }
-        Request::Files { entry } => {
-            let located = clip.located(entry.as_deref(), FILES_WAIT).await?;
+        Request::Files => {
+            let located = clip.located(FILES_WAIT).await?;
 
             Ok(Response::Files {
-                label: located.id.label(),
                 tree: located.tree.map(|tree| tree.to_string_lossy().into_owned()),
-                files: located
-                    .files
-                    .iter()
-                    .map(|file| FileInfo {
-                        path: file.path.clone(),
-                        size: file.size,
-                    })
-                    .collect(),
+                files: located.files,
             })
         }
-        Request::Paste { entry, mime } => {
-            let (mime, alternates, bytes) = clip.paste(entry.as_deref(), mime.as_deref())?;
+        Request::Paste { mime } => {
+            let (mime, alternates, bytes) = clip.paste(mime.as_deref())?;
 
             Ok(Response::Contents {
                 mime,
@@ -226,108 +206,45 @@ async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
                 bytes,
             })
         }
-        Request::History { limit } => {
-            let entries = history(ctx, limit);
+        Request::Clear => {
+            clip.clear();
 
-            Ok(Response::History(entries))
-        }
-        Request::Pick { entry } => {
-            let id = clip.pick(&entry)?;
-
-            Ok(Response::Wrote { label: id.label() })
-        }
-        Request::Forget { entry } => {
-            let id = clip.forget(&entry)?;
-
-            Ok(Response::Wrote { label: id.label() })
-        }
-        Request::Clear { history } => {
-            clip.clear(history)?;
-
-            Ok(Response::Cleared)
+            Ok(Response::Done)
         }
         Request::SetPause { capture, apply } => {
-            Ok(Response::Paused(clip.set_pause(capture, apply)?))
+            Ok(Response::Paused(clip.set_pause(capture, apply)))
         }
     }
 }
 
 /// Snapshots the daemon for `yank status`.
 fn status(ctx: &Context) -> Status {
-    let clip = &ctx.topics.clipboard;
-    let (items, selected) = clip.history();
-    let state = ctx.store.snapshot();
-
     let local = ctx.endpoint.secret_key().public();
-    let selection = items
-        .iter()
-        .find(|item| Some(item.id) == selected)
-        .map(|item| entry(item, &state, local, selected));
+    let state = ctx.store.snapshot();
+    // A machine that left the mesh keeps its clip until the next copy, and
+    // there is no name left for it: show the id.
+    let name = |origin| {
+        if origin == local {
+            "this machine".to_owned()
+        } else {
+            state
+                .peer_name(&origin)
+                .map_or_else(|| origin.to_string(), str::to_owned)
+        }
+    };
 
     Status {
-        endpoint: ctx.endpoint.secret_key().public(),
+        endpoint: local,
         uptime_secs: ctx.started.elapsed().unwrap_or_default().as_secs(),
         version: crate::VERSION.to_string(),
         clipboard: ClipboardStatus {
-            backend: match clip.backend_state() {
-                BackendState::Running => None,
-                BackendState::Down(reason) => Some(sanitize_bounded(&reason)),
-            },
-            pause: clip.pause(),
-            entries: items.len(),
-            selection,
+            backend: ctx
+                .clip
+                .backend_down()
+                .map(|reason| sanitize_bounded(&reason)),
+            pause: ctx.clip.pause(),
+            current: ctx.clip.describe(name),
         },
         peers: ctx.peers.statuses(),
-    }
-}
-
-/// The history, resolved for display.
-fn history(ctx: &Context, limit: Option<usize>) -> Vec<HistoryEntry> {
-    let (items, selected) = ctx.topics.clipboard.history();
-    let state = ctx.store.snapshot();
-
-    let local = ctx.endpoint.secret_key().public();
-
-    items
-        .iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|item| entry(item, &state, local, selected))
-        .collect()
-}
-
-/// Describes one entry, naming the machine it came from.
-fn entry(
-    item: &Item,
-    state: &crate::config::MeshState,
-    local: iroh::EndpointId,
-    selected: Option<crate::log::EntryId>,
-) -> HistoryEntry {
-    // A machine that left the mesh keeps its entries in the history until
-    // they age out, and there is no name left for it: show the id.
-    let origin = if item.id.origin == local {
-        "this machine".to_owned()
-    } else {
-        state
-            .peer_name(&item.id.origin)
-            .map_or_else(|| item.id.origin.to_string(), str::to_owned)
-    };
-    let now = SystemTime::now();
-
-    HistoryEntry {
-        label: item.id.label(),
-        preview: item.preview.clone(),
-        mime: item.mime.clone(),
-        size: item.size,
-        secret: item.secret,
-        files: item.files.len(),
-        origin,
-        age_secs: now
-            .duration_since(item.clock.as_system_time())
-            .unwrap_or_default()
-            .as_secs(),
-        expires_in_secs: item
-            .expires_at
-            .map(|at| at.duration_since(now).unwrap_or_default().as_secs()),
-        selected: Some(item.id) == selected,
     }
 }
