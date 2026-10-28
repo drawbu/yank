@@ -19,7 +19,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, Seek as _, SeekFrom, Write as _},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -39,9 +39,6 @@ const PARTIAL: &str = ".part";
 /// what it turned out to be. A sweep leaves these alone: one of them may
 /// be a copy in progress, and unlinking it would fail the copy.
 const TAKING: &str = "taking-";
-
-/// How much is read at a time when hashing or serving a file.
-const CHUNK: usize = 256 * 1024;
 
 /// A file to take into the spool: where it is now, the name it keeps, and
 /// what it weighed when the selection was walked.
@@ -378,25 +375,12 @@ fn clone_file(source: &Path, dest: &Path) -> eyre::Result<()> {
 
 /// The hash and size of a file on disk.
 fn hash_file(path: &Path) -> eyre::Result<(Hash, u64)> {
-    let mut file = File::open(path).wrap_err_with(|| format!("cannot read {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
-    let mut chunk = vec![0u8; CHUNK];
-    let mut size = 0u64;
+    File::open(path)
+        .and_then(|file| hasher.update_reader(file).map(drop))
+        .wrap_err_with(|| format!("cannot read {}", path.display()))?;
 
-    loop {
-        let read = match file.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
-            }
-        };
-        hasher.update(&chunk[..read]);
-        size += read as u64;
-    }
-
-    Ok((hasher.finalize().into(), size))
+    Ok((hasher.finalize().into(), hasher.count()))
 }
 
 /// Every path in a directory, an absent directory counting as empty.
