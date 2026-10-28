@@ -367,11 +367,11 @@ pub fn walk(roots: &[PathBuf], max_files: usize, max_bytes: u64) -> eyre::Result
 }
 
 /// Copies a file, sharing the blocks with the original where the
-/// filesystem can: on btrfs, XFS, bcachefs and APFS, spooling a four
-/// gigabyte image costs a directory entry rather than four gigabytes.
+/// filesystem can (`copy_file_range` reflinks on btrfs, XFS and bcachefs,
+/// `fclonefileat` on APFS): spooling a four gigabyte image costs a
+/// directory entry rather than four gigabytes.
 fn clone_file(source: &Path, dest: &Path) -> eyre::Result<()> {
-    reflink_copy::reflink_or_copy(source, dest)
-        .wrap_err_with(|| format!("cannot copy {}", source.display()))?;
+    fs::copy(source, dest).wrap_err_with(|| format!("cannot copy {}", source.display()))?;
 
     Ok(())
 }

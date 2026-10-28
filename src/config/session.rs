@@ -16,8 +16,7 @@ use eyre::WrapErr as _;
 #[zbus::proxy(
     interface = "org.freedesktop.systemd1.Manager",
     default_service = "org.freedesktop.systemd1",
-    default_path = "/org/freedesktop/systemd1",
-    gen_blocking = false
+    default_path = "/org/freedesktop/systemd1"
 )]
 trait Manager {
     #[zbus(property)]

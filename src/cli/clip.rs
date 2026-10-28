@@ -232,8 +232,7 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
         // Sharing the blocks with the spool where the filesystem can, the
         // way spooling them did: getting a four gigabyte image out costs a
         // directory entry rather than four gigabytes.
-        reflink_copy::reflink_or_copy(&from, &to)
-            .wrap_err_with(|| format!("cannot write {}", to.display()))?;
+        fs::copy(&from, &to).wrap_err_with(|| format!("cannot write {}", to.display()))?;
     }
 
     anstream::println!(

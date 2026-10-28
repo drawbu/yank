@@ -50,15 +50,11 @@ pub async fn bind_endpoint(
         #[cfg(feature = "test-util")]
         EndpointOptions::LocalTest { lookup } => {
             let endpoint = Endpoint::builder(presets::Minimal)
-                .relay_mode(iroh::RelayMode::Disabled)
+                .address_lookup(lookup.clone())
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
                 .bind()
                 .await?;
-            endpoint
-                .address_lookup()
-                .expect("the endpoint was just bound")
-                .add(lookup.clone());
             lookup.add_endpoint_info(endpoint.addr());
 
             Ok(endpoint)
