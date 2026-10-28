@@ -3,6 +3,8 @@
 //! What the installed service runs, and what to run by hand with
 //! `RUST_LOG=yank=debug` when something needs looking at.
 
+use std::io::IsTerminal as _;
+
 use clap::Args;
 
 use crate::{config::Dirs, daemon};
@@ -13,6 +15,8 @@ pub struct DaemonArgs {}
 
 pub fn run(_args: &DaemonArgs, dirs: &Dirs) -> eyre::Result<()> {
     tracing_subscriber::fmt()
+        // Under the service, stdout is the journal: no colour codes there.
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
                 .with_default_directive("yank=info".parse()?)
