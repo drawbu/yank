@@ -216,12 +216,12 @@ pub fn as_text(paths: &[PathBuf]) -> Vec<u8> {
 /// The path a `file:` URI names, if it names one on this machine.
 fn local_path(uri: &[u8]) -> Option<PathBuf> {
     let rest = uri.strip_prefix(b"file:")?;
-    // `file:/path`, `file:///path`, and `file://host/path`, which is
-    // somebody else's file whatever the host says.
+    // `file:/path`, `file:///path` and `file://localhost/path` are ours;
+    // `file://host/path` is somebody else's file whatever the host says.
     let path = match rest.strip_prefix(b"//") {
         Some(authority) => {
             let start = authority.iter().position(|byte| *byte == b'/')?;
-            if start != 0 {
+            if !matches!(&authority[..start], b"" | b"localhost") {
                 return None;
             }
             &authority[start..]
@@ -291,11 +291,16 @@ mod tests {
     #[test]
     fn only_local_files_are_taken_out_of_a_uri_list() {
         let list = b"# a comment\r\nhttps://example.com/x\r\nfile:///tmp/one\r\n\
-                     file://elsewhere/tmp/two\r\nfile:/tmp/three\r\n";
+                     file://elsewhere/tmp/two\r\nfile:/tmp/three\r\n\
+                     file://localhost/tmp/four\r\n";
 
         assert_eq!(
             paths(list),
-            vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/three")],
+            vec![
+                PathBuf::from("/tmp/one"),
+                PathBuf::from("/tmp/three"),
+                PathBuf::from("/tmp/four"),
+            ],
         );
     }
 
