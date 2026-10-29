@@ -42,13 +42,8 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 zbus = { version = "6.1", default-features = false, features = ["proxy", "tokio"] }
 
-[features]
-# Hermetic endpoints and helpers used by the integration tests.
-test-util = []
-
 [dev-dependencies]
 tempfile = "3"
-yank = { path = ".", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

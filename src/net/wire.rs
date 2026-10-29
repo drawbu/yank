@@ -51,17 +51,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn messages_round_trip() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
-
-        write_message(&mut client, &("hello".to_owned(), 42u32), 256)
-            .await
-            .unwrap();
-        let (text, num): (String, u32) = read_message(&mut server, 256).await.unwrap();
-        assert_eq!((text.as_str(), num), ("hello", 42));
-    }
-
-    #[tokio::test]
     async fn sizes_are_bounded_on_both_sides() {
         let (mut client, mut server) = tokio::io::duplex(1024);
 

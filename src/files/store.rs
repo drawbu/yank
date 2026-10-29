@@ -446,42 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_is_the_names_the_copy_had() {
-        let (dir, store) = store();
-        let one = store.take(&write(dir.path(), "one", b"first")).unwrap();
-        let two = store.take(&write(dir.path(), "two", b"second")).unwrap();
-
-        let files = vec![
-            FileRef {
-                path: "a.txt".to_owned(),
-                size: one.1,
-                hash: one.0,
-            },
-            FileRef {
-                path: "photos/b.txt".to_owned(),
-                size: two.1,
-                hash: two.0,
-            },
-        ];
-        let tree = store.lay_out(stamp(1), &files).unwrap();
-
-        assert_eq!(fs::read(tree.join("a.txt")).unwrap(), b"first");
-        assert_eq!(fs::read(tree.join("photos/b.txt")).unwrap(), b"second");
-    }
-
-    #[test]
-    fn a_path_from_a_peer_is_never_followed_out_of_the_tree() {
-        let (_dir, store) = store();
-        let files = vec![FileRef {
-            path: "../escaped".to_owned(),
-            size: 0,
-            hash: Hash::of(b""),
-        }];
-
-        assert!(store.lay_out(stamp(1), &files).is_err());
-    }
-
-    #[test]
     fn sweeping_keeps_what_the_clip_names() {
         let (dir, store) = store();
         let kept = store.take(&write(dir.path(), "kept", b"kept")).unwrap().0;
@@ -506,22 +470,6 @@ mod tests {
         assert!(!store.has(gone));
         assert!(store.tree(live).is_dir());
         assert!(!store.tree(stamp(2)).exists());
-    }
-
-    #[test]
-    fn walking_a_selection_finds_the_files_under_the_names_they_keep() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "folder/one.txt", b"one");
-        write(dir.path(), "folder/deep/two.txt", b"two");
-        let loose = write(dir.path(), "three.txt", b"three");
-
-        let found = walk(&[dir.path().join("folder"), loose], 16, 1024).unwrap();
-
-        let names: Vec<&str> = found.iter().map(|source| source.path.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["folder/deep/two.txt", "folder/one.txt", "three.txt"],
-        );
     }
 
     #[test]

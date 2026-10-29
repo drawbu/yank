@@ -36,7 +36,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use iroh::Endpoint;
+use iroh::{Endpoint, address_lookup::MemoryLookup};
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use self::{
@@ -48,7 +48,7 @@ use self::{
 };
 use crate::{
     config::{Dirs, MachineKey, MeshState, Settings},
-    net::{EndpointOptions, bind_endpoint, pair, proto},
+    net::{bind_endpoint, pair, proto},
 };
 
 /// Handshakes accepted at once from machines we have not identified yet.
@@ -80,8 +80,9 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Starts every subsystem.
-    pub async fn start(dirs: &Dirs, options: &EndpointOptions) -> eyre::Result<Self> {
+    /// Starts every subsystem, off the network when given a `lookup` (see
+    /// [`bind_endpoint`]).
+    pub async fn start(dirs: &Dirs, lookup: Option<&MemoryLookup>) -> eyre::Result<Self> {
         let key = MachineKey::load(dirs)?;
         let state = MeshState::load(dirs)?;
 
@@ -99,7 +100,7 @@ impl Daemon {
             Settings::default()
         }));
 
-        let endpoint = bind_endpoint(&key, alpns(), options).await?;
+        let endpoint = bind_endpoint(&key, alpns(), lookup).await?;
         tracing::info!("daemon started as {}", key.endpoint_id());
 
         let store = Arc::new(crate::files::Store::open(&dirs.files_dir())?);
@@ -123,7 +124,7 @@ impl Daemon {
         ));
         let pairing = Arc::new(Pairing::new(
             endpoint.clone(),
-            options.uses_relays(),
+            lookup.is_none(),
             mesh.clone(),
         ));
 
@@ -172,7 +173,7 @@ impl Daemon {
 
 /// Runs the daemon until it is asked to stop.
 pub async fn run(dirs: &Dirs) -> eyre::Result<()> {
-    let mut daemon = Daemon::start(dirs, &EndpointOptions::default()).await?;
+    let mut daemon = Daemon::start(dirs, None).await?;
 
     let outcome = tokio::select! {
         () = shutdown_signal() => {

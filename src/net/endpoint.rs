@@ -2,6 +2,7 @@
 
 use iroh::{
     Endpoint,
+    address_lookup::MemoryLookup,
     endpoint::{QuicTransportConfig, presets},
 };
 
@@ -14,64 +15,39 @@ const MAX_UNI_STREAMS: u32 = 16;
 /// Bidirectional streams a peer may have open at once.
 const MAX_BI_STREAMS: u32 = 4;
 
-/// How the endpoint reaches the network.
-#[derive(Debug, Clone, Default)]
-pub enum EndpointOptions {
-    /// The iroh defaults: public relays for the handshake, then a direct
-    /// hole-punched path whenever the network allows one.
-    #[default]
-    Production,
-    /// Hermetic mode for tests: no relays, no external discovery. Every
-    /// endpoint bound with the same `lookup` registers its address there
-    /// and resolves the others through it, so they dial each other by id
-    /// without leaving the machine.
-    #[cfg(feature = "test-util")]
-    LocalTest {
-        lookup: iroh::address_lookup::MemoryLookup,
-    },
-}
-
-impl EndpointOptions {
-    /// Whether endpoints bound with these options use iroh's relays. The
-    /// pairing host waits for a relay address before printing a ticket,
-    /// and there is nothing to wait for without them.
-    pub fn uses_relays(&self) -> bool {
-        match self {
-            EndpointOptions::Production => true,
-            #[cfg(feature = "test-util")]
-            EndpointOptions::LocalTest { .. } => false,
-        }
-    }
-}
-
 /// Binds the endpoint under this machine's identity. `alpns` lists the
 /// protocols accepted from incoming connections.
+///
+/// With no `lookup`, the endpoint uses the iroh defaults: public relays for
+/// the handshake, then a direct hole-punched path whenever the network
+/// allows one. With one, it is hermetic, for tests: no relays, no external
+/// discovery. Every endpoint bound with the same `lookup` registers its
+/// address there and resolves the others through it, so they dial each
+/// other by id without leaving the machine.
 pub async fn bind_endpoint(
     key: &MachineKey,
     alpns: Vec<Vec<u8>>,
-    options: &EndpointOptions,
+    lookup: Option<&MemoryLookup>,
 ) -> eyre::Result<Endpoint> {
-    match options {
-        EndpointOptions::Production => Ok(Endpoint::builder(presets::N0)
+    let Some(lookup) = lookup else {
+        return Ok(Endpoint::builder(presets::N0)
             .transport_config(transport())
             .secret_key(key.secret().clone())
             .alpns(alpns)
             .bind()
-            .await?),
-        #[cfg(feature = "test-util")]
-        EndpointOptions::LocalTest { lookup } => {
-            let endpoint = Endpoint::builder(presets::Minimal)
-                .transport_config(transport())
-                .address_lookup(lookup.clone())
-                .secret_key(key.secret().clone())
-                .alpns(alpns)
-                .bind()
-                .await?;
-            lookup.add_endpoint_info(endpoint.addr());
+            .await?);
+    };
 
-            Ok(endpoint)
-        }
-    }
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .transport_config(transport())
+        .address_lookup(lookup.clone())
+        .secret_key(key.secret().clone())
+        .alpns(alpns)
+        .bind()
+        .await?;
+    lookup.add_endpoint_info(endpoint.addr());
+
+    Ok(endpoint)
 }
 
 /// The iroh defaults, with bounds on the streams a peer may open: it is

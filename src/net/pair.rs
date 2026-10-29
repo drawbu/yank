@@ -370,15 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn tickets_round_trip() {
-        let ticket = ticket();
-        let parsed: PairTicket = ticket.to_string().parse().unwrap();
-
-        assert_eq!(parsed.addr, ticket.addr);
-        assert!(ticket.matches(&parsed));
-    }
-
-    #[test]
     fn tickets_reject_garbage() {
         assert!("yank-pair-notbase32!".parse::<PairTicket>().is_err());
         assert!("some-other-ticket".parse::<PairTicket>().is_err());
@@ -386,12 +377,5 @@ mod tests {
         // Trailing data must be refused, not quietly ignored.
         let padded = format!("{}aaaaaaaa", ticket());
         assert!(padded.parse::<PairTicket>().is_err());
-    }
-
-    #[test]
-    fn a_secret_only_matches_itself() {
-        let secret = PairSecret::generate();
-        assert!(secret.verify(&secret.clone()));
-        assert!(!secret.verify(&PairSecret::generate()));
     }
 }

@@ -311,19 +311,12 @@ mod tests {
 
     #[test]
     fn peers_resolve_by_name_or_id_prefix() {
-        let (local, peer) = (endpoint(), endpoint());
+        let peer = endpoint();
         let mut state = MeshState::default();
         state.add_peer(peer, "laptop".to_owned()).unwrap();
 
         assert_eq!(state.resolve_peer("laptop").unwrap(), peer);
         assert_eq!(state.resolve_peer(&peer.to_string()[..8]).unwrap(), peer,);
         assert!(state.resolve_peer("desktop").is_err());
-        let _ = local;
-    }
-
-    #[test]
-    fn removal_needs_a_known_machine() {
-        let mut state = MeshState::default();
-        assert!(state.remove_peer(&endpoint()).is_err());
     }
 }

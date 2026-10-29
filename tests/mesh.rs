@@ -1,6 +1,6 @@
 //! Two machines, end to end.
 //!
-//! Every test here runs two whole daemons in one process, talking over
+//! Every test here runs whole daemons in one process, talking over
 //! hermetic iroh endpoints (no relays, no DNS, nothing outside the
 //! machine) and driven through their control sockets exactly as the CLI
 //! drives them. What is being checked is the behaviour the design is for:
@@ -16,16 +16,16 @@ use std::{
     time::Duration,
 };
 
+use iroh::address_lookup::MemoryLookup;
 use tempfile::TempDir;
 use yank::{
     cli,
     config::Dirs,
     daemon::{
         Daemon,
-        control::{Request, Response},
+        control::{ConnectionStatus, Request, Response},
     },
     files::FileRef,
-    net::EndpointOptions,
 };
 
 const SETTLE: Duration = Duration::from_secs(20);
@@ -35,26 +35,23 @@ struct Machine {
     daemon: Option<Daemon>,
     /// Kept so the directory outlives the machine, restarts included.
     home: TempDir,
-    options: EndpointOptions,
+    lookup: MemoryLookup,
 }
 
 impl Machine {
-    async fn start(lookup: &iroh::address_lookup::MemoryLookup) -> eyre::Result<Self> {
+    async fn start(lookup: &MemoryLookup) -> eyre::Result<Self> {
         let home = tempfile::tempdir()?;
         let dirs = Dirs::new(Some(home.path().to_owned()))?;
         // Keeps the tests off the compositor of the machine running them.
         std::fs::write(home.path().join("config.toml"), "clipboard = false\n")?;
 
-        let options = EndpointOptions::LocalTest {
-            lookup: lookup.clone(),
-        };
-        let daemon = Daemon::start(&dirs, &options).await?;
+        let daemon = Daemon::start(&dirs, Some(lookup)).await?;
 
         Ok(Machine {
             dirs,
             daemon: Some(daemon),
             home,
-            options,
+            lookup: lookup.clone(),
         })
     }
 
@@ -66,7 +63,7 @@ impl Machine {
 
     async fn restart(&mut self) -> eyre::Result<()> {
         self.stop().await;
-        self.daemon = Some(Daemon::start(&self.dirs, &self.options).await?);
+        self.daemon = Some(Daemon::start(&self.dirs, Some(&self.lookup)).await?);
 
         Ok(())
     }
@@ -135,6 +132,39 @@ impl Machine {
         }
     }
 
+    /// Issues a pairing ticket, naming this machine `name`.
+    async fn ticket(&self, name: &str) -> eyre::Result<String> {
+        let name = name.to_owned();
+        match self.ask(&Request::PairHost { name }).await? {
+            Response::PairTicket(ticket) => Ok(ticket),
+            other => eyre::bail!("unexpected answer: {other:?}"),
+        }
+    }
+
+    /// Redeems a ticket, naming this machine `name`.
+    async fn join(&self, ticket: String, name: &str) -> eyre::Result<()> {
+        let name = name.to_owned();
+        match self.ask(&Request::PairJoin { ticket, name }).await? {
+            Response::Paired(_) => Ok(()),
+            other => eyre::bail!("unexpected answer: {other:?}"),
+        }
+    }
+
+    /// The machines this one is paired with, and whether each is connected.
+    async fn peers(&self) -> eyre::Result<Vec<(String, bool)>> {
+        match self.ask(&Request::Status).await? {
+            Response::Status(status) => Ok(status
+                .peers
+                .into_iter()
+                .map(|peer| {
+                    let connected = matches!(peer.connection, ConnectionStatus::Connected { .. });
+                    (peer.name, connected)
+                })
+                .collect()),
+            other => eyre::bail!("unexpected answer: {other:?}"),
+        }
+    }
+
     /// Waits until the clipboard previews as `expected`.
     async fn holds(&self, expected: Option<&str>) {
         eventually(&format!("the clipboard to hold {expected:?}"), || async {
@@ -146,26 +176,7 @@ impl Machine {
 
 /// Pairs two machines through their control sockets, ticket and all.
 async fn pair(host: &Machine, joiner: &Machine) -> eyre::Result<()> {
-    let ticket = match host
-        .ask(&Request::PairHost {
-            name: "host".to_owned(),
-        })
-        .await?
-    {
-        Response::PairTicket(ticket) => ticket,
-        other => eyre::bail!("unexpected answer: {other:?}"),
-    };
-
-    match joiner
-        .ask(&Request::PairJoin {
-            ticket,
-            name: "joiner".to_owned(),
-        })
-        .await?
-    {
-        Response::Paired(_) => Ok(()),
-        other => eyre::bail!("unexpected answer: {other:?}"),
-    }
+    joiner.join(host.ticket("host").await?, "joiner").await
 }
 
 /// Polls until `check` holds, which is how a test waits for something to
@@ -189,7 +200,7 @@ where
 }
 
 async fn mesh() -> eyre::Result<(Machine, Machine)> {
-    let lookup = iroh::address_lookup::MemoryLookup::default();
+    let lookup = MemoryLookup::default();
     let first = Machine::start(&lookup).await?;
     let second = Machine::start(&lookup).await?;
     pair(&first, &second).await?;
@@ -218,6 +229,101 @@ async fn what_one_machine_copies_the_other_can_paste() -> eyre::Result<()> {
     // And back the other way, on the same connection.
     second.copy("from the second").await?;
     first.holds(Some("from the second")).await;
+
+    Ok(())
+}
+
+/// A ticket pairs one machine, once: one revoked by a newer ticket, or
+/// already redeemed, pairs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_pairs_once_and_only_while_outstanding() -> eyre::Result<()> {
+    let lookup = MemoryLookup::default();
+    let host = Machine::start(&lookup).await?;
+    let joiner = Machine::start(&lookup).await?;
+    let stranger = Machine::start(&lookup).await?;
+
+    let revoked = host.ticket("host").await?;
+    let outstanding = host.ticket("host").await?;
+    assert!(joiner.join(revoked, "joiner").await.is_err());
+    assert!(host.peers().await?.is_empty());
+    assert!(joiner.peers().await?.is_empty());
+
+    joiner.join(outstanding.clone(), "joiner").await?;
+    assert!(stranger.join(outstanding, "stranger").await.is_err());
+    assert!(stranger.peers().await?.is_empty());
+    eventually("the host to list the joiner alone", || async {
+        let peers = host.peers().await?;
+        Ok(peers.len() == 1 && peers[0].0 == "joiner")
+    })
+    .await;
+
+    Ok(())
+}
+
+/// Machines that only paired with a third learn of each other through
+/// its gossip, connect, and share without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn machines_paired_through_a_third_find_each_other() -> eyre::Result<()> {
+    let lookup = MemoryLookup::default();
+    let mut middle = Machine::start(&lookup).await?;
+    let first = Machine::start(&lookup).await?;
+    let second = Machine::start(&lookup).await?;
+    first.join(middle.ticket("middle").await?, "first").await?;
+    second
+        .join(middle.ticket("middle").await?, "second")
+        .await?;
+
+    let connected = |peers: Vec<(String, bool)>, other: &str| {
+        peers.iter().any(|(name, up)| name == other && *up)
+    };
+    eventually("the two to connect to each other", || async {
+        Ok(connected(first.peers().await?, "second") && connected(second.peers().await?, "first"))
+    })
+    .await;
+
+    middle.stop().await;
+    first.copy("past the third").await?;
+    second.holds(Some("past the third")).await;
+
+    Ok(())
+}
+
+/// A removed machine is cut off: the remover forgets it, the connection
+/// goes, and what is copied afterwards no longer reaches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_machine_no_longer_shares() -> eyre::Result<()> {
+    let (first, second) = mesh().await?;
+    first.copy("before").await?;
+    second.holds(Some("before")).await;
+
+    first
+        .ask(&Request::RemovePeer {
+            peer: "joiner".to_owned(),
+        })
+        .await?;
+    eventually("the remover to forget the machine", || async {
+        Ok(first.peers().await?.is_empty())
+    })
+    .await;
+    eventually("the removed machine to lose its connection", || async {
+        Ok(second
+            .peers()
+            .await?
+            .iter()
+            .all(|(_, connected)| !connected))
+    })
+    .await;
+
+    // Each copy is the latest on its own side, so either one crossing
+    // would show.
+    second.copy("from the removed machine").await?;
+    first.copy("after").await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        second.current().await?.as_deref(),
+        Some("from the removed machine")
+    );
+    assert_eq!(first.current().await?.as_deref(), Some("after"));
 
     Ok(())
 }

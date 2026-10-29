@@ -9,4 +9,4 @@ pub mod pair;
 pub mod proto;
 pub mod wire;
 
-pub use endpoint::{EndpointOptions, bind_endpoint};
+pub use endpoint::bind_endpoint;

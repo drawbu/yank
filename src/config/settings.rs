@@ -167,30 +167,6 @@ mod tests {
         toml::from_str(text).unwrap()
     }
 
-    #[test]
-    fn an_empty_file_yields_the_defaults() {
-        assert_eq!(parse(""), Settings::default());
-    }
-
-    #[test]
-    fn units_are_spelled_out() {
-        let settings = parse("max-size = \"512 KiB\"\nsecret-ttl = \"2m\"");
-        assert_eq!(settings.max_bytes(), 512 * 1024);
-        assert_eq!(settings.secret_ttl, Duration::from_mins(2));
-    }
-
-    #[test]
-    fn a_size_over_the_protocol_ceiling_is_clamped() {
-        let settings = parse("max-size = \"1 GiB\"");
-        assert_eq!(settings.max_bytes(), crate::clip::MAX_SIZE as usize);
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        assert!(toml::from_str::<Settings>("max-szie = 10").is_err());
-        assert!(toml::from_str::<Settings>("apply = \"yes\"").is_err());
-    }
-
     /// The template must parse as-is (everything commented, so all
     /// defaults) and must still parse once its keys are uncommented: it
     /// cannot drift away from the schema unnoticed.

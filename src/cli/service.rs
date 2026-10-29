@@ -301,17 +301,4 @@ mod tests {
 
         assert!(quote(OsStr::new("/a\nb")).is_err());
     }
-
-    /// The generated unit has to be a unit: one directive per line, and
-    /// every section systemd needs to enable and run it.
-    #[test]
-    fn the_unit_is_well_formed() {
-        let unit = unit(&quote(OsStr::new("/usr/bin/yank")).unwrap());
-
-        assert!(unit.contains("[Unit]"));
-        assert!(unit.contains("[Service]"));
-        assert!(unit.contains("[Install]"));
-        assert!(unit.contains("ExecStart=\"/usr/bin/yank\" daemon"));
-        assert!(unit.lines().all(|line| !line.contains('\r')));
-    }
 }

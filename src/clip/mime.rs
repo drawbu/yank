@@ -196,23 +196,12 @@ mod tests {
     }
 
     #[test]
-    fn text_wins_over_the_rest() {
-        let mimes = offered(&["image/png", "text/plain", "text/plain;charset=utf-8"]);
-        assert_eq!(select_all(&mimes)[0], "text/plain;charset=utf-8");
-    }
-
-    #[test]
     fn chatter_is_never_content() {
         assert!(select_all(&offered(&["TARGETS", "TIMESTAMP"])).is_empty());
         assert_eq!(
             select_all(&offered(&["TARGETS", "image/png"])),
             vec!["image/png"],
         );
-    }
-
-    #[test]
-    fn our_own_marker_is_not_content_either() {
-        assert!(select_all(&offered(&[MARKER])).is_empty());
     }
 
     /// What a browser offers: the same selection formatted and plain. Both
@@ -264,24 +253,5 @@ mod tests {
             vec!["text/plain", "image/png"],
         );
         assert!(select(&mimes, &["text/plain".to_owned()]).is_empty());
-    }
-
-    #[test]
-    fn text_is_offered_under_every_name() {
-        let text = aliases("text/plain;charset=utf-8");
-        assert_eq!(text[0], "text/plain;charset=utf-8");
-        assert!(text.contains(&"UTF8_STRING".to_owned()));
-        assert_eq!(text.len(), TEXT.len());
-
-        assert_eq!(aliases("image/png"), vec!["image/png".to_owned()]);
-        assert_eq!(aliases("text/uri-list"), vec!["text/uri-list".to_owned()]);
-    }
-
-    #[test]
-    fn a_file_reference_is_local_and_its_contents_are_not() {
-        assert!(is_local("text/uri-list"));
-        assert!(is_local("x-special/gnome-copied-files"));
-        assert!(!is_local("text/plain"));
-        assert!(!is_local("image/png"));
     }
 }

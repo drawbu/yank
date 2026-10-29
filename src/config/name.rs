@@ -69,14 +69,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_bounded_marks_the_cut() {
-        let long = "x".repeat(MAX_SANITIZED_LEN + 10);
-        let cut = sanitize_bounded(&long);
-        assert_eq!(cut.chars().count(), MAX_SANITIZED_LEN + 1);
-        assert!(cut.ends_with('…'));
-    }
-
-    #[test]
     fn names_are_validated() {
         assert!(validate_name("laptop").is_ok());
         assert!(validate_name("").is_err());

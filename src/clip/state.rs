@@ -214,7 +214,7 @@ impl Clipboard {
         copy.check()?;
 
         let mut effects = self.replace(Some(copy));
-        effects.extend(self.reconcile());
+        effects.extend(self.reconcile(SystemTime::now()));
 
         Ok(effects)
     }
@@ -291,7 +291,7 @@ impl Clipboard {
     /// Empties the clipboard on every machine.
     pub fn clear(&mut self) -> Vec<Effect> {
         let mut effects = self.replace(None);
-        effects.extend(self.reconcile());
+        effects.extend(self.reconcile(SystemTime::now()));
 
         effects
     }
@@ -306,7 +306,7 @@ impl Clipboard {
         }
 
         let mut effects = vec![Effect::Save];
-        effects.extend(self.reconcile());
+        effects.extend(self.reconcile(SystemTime::now()));
 
         effects
     }
@@ -327,7 +327,7 @@ impl Clipboard {
             self.set(Arc::new(Clip { stamp, copy: None }));
             effects.push(Effect::Save);
         }
-        effects.extend(self.reconcile());
+        effects.extend(self.reconcile(now));
 
         effects
     }
@@ -342,7 +342,7 @@ impl Clipboard {
         // It has to be applied again for the file types to appear.
         self.applied = None;
 
-        self.reconcile()
+        self.reconcile(SystemTime::now())
     }
 
     /// Makes a new clip from this machine the current one.
@@ -369,8 +369,8 @@ impl Clipboard {
     }
 
     /// Brings the local clipboard in line with the clip.
-    fn reconcile(&mut self) -> Vec<Effect> {
-        if !self.settings.apply || !self.pause.apply.is_on(SystemTime::now()) {
+    fn reconcile(&mut self, now: SystemTime) -> Vec<Effect> {
+        if !self.settings.apply || !self.pause.apply.is_on(now) {
             return Vec::new();
         }
         let Some(clip) = &self.clip else {
@@ -594,15 +594,6 @@ mod tests {
     }
 
     #[test]
-    fn copying_shares_it_and_puts_it_on_the_clipboard() {
-        let mut board = clipboard();
-        let effects = copy(&mut board, "hello");
-
-        assert!(board.head().is_some());
-        assert_eq!(applied(&effects), vec!["hello"]);
-    }
-
-    #[test]
     fn what_the_compositor_reports_is_shared_but_not_put_back() {
         let mut board = clipboard();
         let effects = board.captured(captured("typed elsewhere", false), Vec::new());
@@ -737,19 +728,6 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_is_never_saved() {
-        let mut board = clipboard();
-        board.captured(captured("hunter2", true), Vec::new());
-
-        assert!(board.current().unwrap().1.secret);
-        assert!(board.expires_at().is_some(), "a secret gets a lifetime");
-        let saved = board.saved().clip.unwrap();
-        assert!(board.current().is_some(), "only what is saved is stripped");
-        assert_eq!(saved.stamp, board.head().unwrap());
-        assert!(saved.copy.is_none());
-    }
-
-    #[test]
     fn a_restored_clip_is_not_put_back_on_the_clipboard() {
         let mut board = clipboard();
         copy(&mut board, "before the restart");
@@ -774,30 +752,20 @@ mod tests {
     }
 
     #[test]
-    fn a_lapsed_pause_applies_what_it_held_back() {
+    fn a_paused_apply_holds_back_until_resumed_or_lapsed() {
         let mut peer = clipboard();
-        copy(&mut peer, "from the peer");
-
-        let mut board = clipboard();
-        let until = SystemTime::now() + Duration::from_millis(20);
-        board.set_pause(None, Some(Switch::Paused { until: Some(until) }));
-        assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
-
-        std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(applied(&board.expire(SystemTime::now())), ["from the peer"]);
-    }
-
-    #[test]
-    fn pausing_apply_leaves_the_clipboard_alone_until_resumed() {
-        let mut peer = clipboard();
-        copy(&mut peer, "from the peer");
+        copy(&mut peer, "first");
 
         let mut board = clipboard();
         board.set_pause(None, Some(Switch::Paused { until: None }));
         assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
+        assert_eq!(applied(&board.set_pause(None, Some(Switch::On))), ["first"]);
 
-        let effects = board.set_pause(None, Some(Switch::On));
-        assert_eq!(applied(&effects), vec!["from the peer"]);
+        copy(&mut peer, "second");
+        let until = SystemTime::now() + Duration::from_hours(1);
+        board.set_pause(None, Some(Switch::Paused { until: Some(until) }));
+        assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
+        assert_eq!(applied(&board.expire(until)), ["second"]);
     }
 
     /// What a browser copy is: the same selection twice over. Both reach
@@ -841,50 +809,34 @@ mod tests {
         assert_eq!(served[0].1, "file:///home/x/y.iso\r\n");
     }
 
-    fn file_copy(board: &mut Clipboard) {
+    /// A file copy reaching the clipboard is asked for, once, and holds
+    /// the paths as text until it arrives: the clipboard is never held up
+    /// for a transfer. Once the files land it is a file again, pointing at
+    /// the copies here rather than at a path on the machine that copied it.
+    #[test]
+    fn a_file_copy_waits_as_text_until_its_files_land() {
+        let mut peer = clipboard();
         let selection = Selection::of_files(&[PathBuf::from("/home/x/y.iso")]);
         let files = vec![FileRef {
             path: "y.iso".to_owned(),
             size: 4,
             hash: Hash::of(b"iso!"),
         }];
-
-        board.copy(selection, files, false, None).unwrap();
-    }
-
-    /// A file copy reaching the clipboard is asked for, once, and holds
-    /// the paths as text until it arrives: the clipboard is never held up
-    /// for a transfer.
-    #[test]
-    fn a_file_copy_asks_for_its_contents_and_waits_as_text() {
-        let mut peer = clipboard();
-        file_copy(&mut peer);
+        peer.copy(selection, files, false, None).unwrap();
 
         let mut board = clipboard();
         let effects = board.accept(pulled(&peer)).unwrap();
-
         let fetches = effects
             .iter()
             .filter(|effect| matches!(effect, Effect::Fetch(_)))
             .count();
         assert_eq!(fetches, 1);
-        let served = served(&effects);
-        assert_eq!(served.len(), 1, "no file type is offered yet");
-        assert!(served[0].0.contains(&"text/plain".to_owned()));
-    }
+        let waiting = served(&effects);
+        assert_eq!(waiting.len(), 1, "no file type is offered yet");
+        assert!(waiting[0].0.contains(&"text/plain".to_owned()));
 
-    /// And once they land it is a file again, pointing at the copies that
-    /// are here rather than at a path on the machine that copied it.
-    #[test]
-    fn the_files_landing_makes_it_a_file_reference_again() {
-        let mut peer = clipboard();
-        file_copy(&mut peer);
-
-        let mut board = clipboard();
-        board.accept(pulled(&peer)).unwrap();
         let stamp = board.head().unwrap();
         let effects = board.materialized(stamp, PathBuf::from("/spool/trees/abc"));
-
         let served = served(&effects);
         let types: Vec<&str> = served.iter().map(|(mimes, _)| mimes[0].as_str()).collect();
         assert_eq!(

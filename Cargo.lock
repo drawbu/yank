@@ -4105,7 +4105,6 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
- "yank",
  "zbus",
  "zeroize",
 ]
