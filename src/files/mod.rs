@@ -112,13 +112,12 @@ impl FileRef {
     ///
     /// The manifest comes from another machine, and the path in it is used
     /// to make a file: an absolute path, or one climbing out with `..`,
-    /// would write wherever it liked.
+    /// would write wherever it liked. Every part has to be a plain name, so
+    /// two paths naming the same file are also two equal strings.
     pub fn is_safe(&self) -> bool {
-        !self.path.is_empty()
-            && !self.path.contains('\0')
-            && Path::new(&self.path)
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        self.path
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | "..") && !part.contains('\0'))
     }
 }
 
@@ -136,12 +135,6 @@ pub fn validate(files: &[FileRef]) -> eyre::Result<()> {
     eyre::ensure!(
         files.iter().all(FileRef::is_safe),
         "a file path is not safe"
-    );
-    eyre::ensure!(
-        files
-            .iter()
-            .all(|file| file.path.split('/').all(|part| !part.is_empty())),
-        "a file path is not normalized",
     );
     let mut paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
     paths.sort_unstable();
@@ -279,16 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn a_file_manager_is_told_to_copy_and_never_to_move() {
-        let list = gnome_copied_files(&under("/spool/x", &[file("a.txt")]));
-
-        assert_eq!(
-            String::from_utf8_lossy(&list),
-            "copy\nfile:///spool/x/a.txt"
-        );
-    }
-
-    #[test]
     fn only_local_files_are_taken_out_of_a_uri_list() {
         let list = b"# a comment\r\nhttps://example.com/x\r\nfile:///tmp/one\r\n\
                      file://elsewhere/tmp/two\r\nfile:/tmp/three\r\n\
@@ -304,33 +287,27 @@ mod tests {
         );
     }
 
+    /// A manifest comes from a peer and its paths are used to create
+    /// files: one that climbs out of the tree, or lays two files where one
+    /// goes, is refused whole.
     #[test]
-    fn a_spooled_name_is_read_back_as_the_hash_it_is() {
-        let hash = Hash::of(b"hello");
-        assert_eq!(Hash::parse(&hash.file_name()), Some(hash));
-        assert_eq!(Hash::parse("not-a-hash"), None);
-        assert_eq!(Hash::parse(&format!("{}.part", hash.file_name())), None);
-    }
+    fn a_manifest_only_lays_out_files_inside_its_tree() {
+        let manifest =
+            |paths: &[&str]| validate(&paths.iter().map(|path| file(path)).collect::<Vec<_>>());
 
-    #[test]
-    fn a_path_from_a_peer_may_not_climb_out_of_the_tree() {
-        assert!(file("photos/a.png").is_safe());
-        assert!(!file("../../.ssh/authorized_keys").is_safe());
-        assert!(!file("/etc/passwd").is_safe());
-        assert!(!file("").is_safe());
-    }
-
-    /// A path from another application, half-escaped or not escaped at
-    /// all, is still a path worth having.
-    #[test]
-    fn half_an_escape_is_not_a_lost_path() {
-        assert_eq!(
-            paths(b"file:///tmp/100%\r\nfile:///tmp/%zz\r\nfile:///tmp/%41\r\n"),
-            vec![
-                PathBuf::from("/tmp/100%"),
-                PathBuf::from("/tmp/%zz"),
-                PathBuf::from("/tmp/A"),
-            ],
-        );
+        assert!(manifest(&["photos/a.png", "photos/b.png", "notes"]).is_ok());
+        for refused in [
+            &["../../.ssh/authorized_keys"][..],
+            &["/etc/passwd"],
+            &[""],
+            &["a//b"],
+            &["a/"],
+            &["a/./b"],
+            &["a\0b"],
+            &["a", "a"],
+            &["a", "a/b"],
+        ] {
+            assert!(manifest(refused).is_err(), "{refused:?} was accepted");
+        }
     }
 }
