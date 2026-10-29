@@ -34,7 +34,10 @@ use std::{
 };
 
 use eyre::WrapErr as _;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    pipe::{PipeFlags, pipe_with},
+};
 use tokio::sync::mpsc as tokio_mpsc;
 use wayland_client::{
     Connection, QueueHandle,
@@ -81,7 +84,8 @@ impl Wayland {
         policy: Policy,
         socket: Option<PathBuf>,
     ) -> eyre::Result<Self> {
-        let (wake_rx, wake) = rustix::pipe::pipe().wrap_err("cannot create the wake pipe")?;
+        let (wake_rx, wake) =
+            pipe_with(PipeFlags::CLOEXEC).wrap_err("cannot create the wake pipe")?;
         let (commands, queue) = mpsc::channel();
         let (ready, started) = mpsc::channel();
 
@@ -347,7 +351,7 @@ impl Session {
 
         let mut pipes = Vec::with_capacity(pending.mimes.len());
         for mime in pending.mimes {
-            let (read, write) = match rustix::pipe::pipe() {
+            let (read, write) = match pipe_with(PipeFlags::CLOEXEC) {
                 Ok(pipe) => pipe,
                 Err(err) => return tracing::warn!("cannot create a clipboard pipe: {err}"),
             };
