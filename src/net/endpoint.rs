@@ -1,8 +1,18 @@
 //! Binding the iroh endpoint that carries every peer connection.
 
-use iroh::{Endpoint, endpoint::presets};
+use iroh::{
+    Endpoint,
+    endpoint::{QuicTransportConfig, presets},
+};
 
 use crate::config::MachineKey;
+
+/// Unidirectional streams a peer may have open at once. Past it, the peer
+/// waits for one to close rather than having its message dropped.
+const MAX_UNI_STREAMS: u32 = 16;
+
+/// Bidirectional streams a peer may have open at once.
+const MAX_BI_STREAMS: u32 = 4;
 
 /// How the endpoint reaches the network.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +53,7 @@ pub async fn bind_endpoint(
 ) -> eyre::Result<Endpoint> {
     match options {
         EndpointOptions::Production => Ok(Endpoint::builder(presets::N0)
+            .transport_config(transport())
             .secret_key(key.secret().clone())
             .alpns(alpns)
             .bind()
@@ -50,6 +61,7 @@ pub async fn bind_endpoint(
         #[cfg(feature = "test-util")]
         EndpointOptions::LocalTest { lookup } => {
             let endpoint = Endpoint::builder(presets::Minimal)
+                .transport_config(transport())
                 .address_lookup(lookup.clone())
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
@@ -60,4 +72,15 @@ pub async fn bind_endpoint(
             Ok(endpoint)
         }
     }
+}
+
+/// The iroh defaults, with bounds on the streams a peer may open: it is
+/// authenticated, which is not a licence to make us spawn as much work as
+/// it likes. Set here so the handshake advertises them; lowering them on a
+/// connection only takes effect once the peer's first allowance is spent.
+fn transport() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_concurrent_uni_streams(MAX_UNI_STREAMS.into())
+        .max_concurrent_bidi_streams(MAX_BI_STREAMS.into())
+        .build()
 }

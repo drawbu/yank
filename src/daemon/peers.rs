@@ -34,7 +34,7 @@ use iroh::{
     Endpoint, EndpointId, TransportAddr,
     endpoint::{Connection, RecvStream, SendStream},
 };
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 use super::{backoff::Backoff, control, hub::Hub, topics::Topics};
 use crate::{
@@ -48,12 +48,6 @@ use crate::{
         wire::{read_message, write_message},
     },
 };
-
-/// Incoming one-shot streams handled at once per connection.
-const MAX_UNI_STREAMS: usize = 16;
-
-/// Incoming bidirectional streams served at once per connection.
-const MAX_ASK_STREAMS: usize = 4;
 
 /// Budget for reading one message, so a stalled stream does not hold its
 /// slot forever.
@@ -381,10 +375,6 @@ impl PeerTask {
     /// Serves one connection until it closes.
     async fn serve(&mut self, mut conn: Connection, mut outbound: bool) {
         let mut since = SystemTime::now();
-        // The peer is authenticated, which is not a licence to make us
-        // spawn as much work as it likes.
-        let uni_permits = Arc::new(Semaphore::new(MAX_UNI_STREAMS));
-        let ask_permits = Arc::new(Semaphore::new(MAX_ASK_STREAMS));
 
         let (mut summaries, inbox) = mpsc::channel(SUMMARY_QUEUE);
         let mut fetcher = tokio::spawn(run_fetcher(
@@ -437,14 +427,14 @@ impl PeerTask {
                         tracing::debug!(peer = %self.name, "connection lost");
                         break;
                     };
-                    self.serve_uni(stream, &uni_permits, &summaries);
+                    self.serve_uni(stream, &summaries);
                 }
                 stream = conn.accept_bi() => {
                     let Ok((send, recv)) = stream else {
                         tracing::debug!(peer = %self.name, "connection lost");
                         break;
                     };
-                    self.serve_ask(send, recv, &ask_permits);
+                    self.serve_ask(send, recv);
                 }
             }
         }
@@ -454,23 +444,12 @@ impl PeerTask {
     }
 
     /// Reads one announcement or membership and routes it.
-    fn serve_uni(
-        &self,
-        mut stream: RecvStream,
-        permits: &Arc<Semaphore>,
-        summaries: &mpsc::Sender<Summary>,
-    ) {
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            tracing::debug!(peer = %self.name, "dropping a message: too many open streams");
-            return;
-        };
-
+    fn serve_uni(&self, mut stream: RecvStream, summaries: &mpsc::Sender<Summary>) {
         let gossip = self.gossip.clone();
         let summaries = summaries.clone();
         let peer = self.peer_id;
         let name = self.name.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let read = tokio::time::timeout(
                 STREAM_READ_TIMEOUT,
                 read_message::<UniMessage>(&mut stream, proto::MAX_UNI_SIZE),
@@ -502,17 +481,11 @@ impl PeerTask {
     }
 
     /// Answers whatever a peer opened a stream to ask for.
-    fn serve_ask(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            tracing::debug!(peer = %self.name, "dropping a request: too many open streams");
-            return;
-        };
-
+    fn serve_ask(&self, send: SendStream, mut recv: RecvStream) {
         let topics = self.topics.clone();
         let store = self.store.clone();
         let name = self.name.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let read = tokio::time::timeout(
                 STREAM_READ_TIMEOUT,
                 read_message::<Ask>(&mut recv, proto::MAX_REQUEST_SIZE),
