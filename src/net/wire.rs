@@ -17,11 +17,21 @@ pub async fn write_message<T: Serialize>(
     max_size: u32,
 ) -> eyre::Result<()> {
     let bytes = postcard::to_stdvec(message).wrap_err("cannot encode message")?;
+
+    write_encoded(send, &bytes, max_size).await
+}
+
+/// Writes a message already encoded, for one sent many times.
+pub async fn write_encoded(
+    send: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+    max_size: u32,
+) -> eyre::Result<()> {
     let size = u32::try_from(bytes.len()).wrap_err("message too large")?;
     eyre::ensure!(size <= max_size, "message too large");
 
     send.write_all(&size.to_le_bytes()).await?;
-    send.write_all(&bytes).await?;
+    send.write_all(bytes).await?;
 
     Ok(())
 }

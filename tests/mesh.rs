@@ -281,6 +281,11 @@ async fn machines_paired_through_a_third_find_each_other() -> eyre::Result<()> {
     })
     .await;
 
+    // Announced to the second by both others at once.
+    first.copy("to both").await?;
+    middle.holds(Some("to both")).await;
+    second.holds(Some("to both")).await;
+
     middle.stop().await;
     first.copy("past the third").await?;
     second.holds(Some("past the third")).await;

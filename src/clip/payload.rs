@@ -1,6 +1,10 @@
 //! The bytes of one representation.
 
-use std::{fmt, ops::Deref, sync::Arc};
+use std::{
+    fmt,
+    ops::Deref,
+    sync::{Arc, Weak},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::Zeroizing;
@@ -14,6 +18,23 @@ use zeroize::Zeroizing;
 /// byte by byte.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Payload(Arc<Zeroizing<Vec<u8>>>);
+
+/// A [`Payload`] that does not keep its bytes alive.
+#[derive(Debug, Default)]
+pub struct WeakPayload(Weak<Zeroizing<Vec<u8>>>);
+
+impl Payload {
+    pub fn downgrade(&self) -> WeakPayload {
+        WeakPayload(Arc::downgrade(&self.0))
+    }
+}
+
+impl WeakPayload {
+    /// The bytes, while some holder keeps them.
+    pub fn upgrade(&self) -> Option<Payload> {
+        self.0.upgrade().map(Payload)
+    }
+}
 
 impl From<Vec<u8>> for Payload {
     fn from(bytes: Vec<u8>) -> Self {

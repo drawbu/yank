@@ -29,7 +29,7 @@
 //! reconnected receives the current state rather than a backlog.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -40,7 +40,7 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     task::JoinSet,
 };
 
@@ -51,7 +51,7 @@ use crate::{
     files::Store,
     net::{
         proto::{self, Ask, ContentReply, ContentRequest, UniMessage},
-        wire::{read_message, write_message},
+        wire::{read_message, write_encoded, write_message},
     },
 };
 
@@ -92,7 +92,22 @@ pub struct PeerSet {
     gossip: mpsc::Sender<MeshState>,
     /// The spool, to serve a peer the content a clip named.
     store: Arc<Store>,
+    pulls: Arc<Pulls>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
+}
+
+/// The clips being pulled, from any peer: a clip announced by several
+/// peers at once is fetched from one of them.
+#[derive(Debug, Default)]
+struct Pulls {
+    stamps: Mutex<BTreeSet<Stamp>>,
+    done: Notify,
+}
+
+/// The pull of one clip, released when dropped.
+struct Pull<'a> {
+    pulls: &'a Pulls,
+    stamp: Stamp,
 }
 
 /// Bookkeeping for one peer task.
@@ -126,6 +141,7 @@ impl PeerSet {
             mesh,
             gossip,
             store,
+            pulls: Arc::default(),
             peers: Mutex::new(BTreeMap::new()),
         }
     }
@@ -246,6 +262,7 @@ impl PeerSet {
             mesh: self.mesh.clone(),
             gossip: self.gossip.clone(),
             store: self.store.clone(),
+            pulls: self.pulls.clone(),
             inbound: rx,
         }));
 
@@ -299,6 +316,7 @@ struct PeerTask {
     mesh: watch::Receiver<MeshState>,
     gossip: mpsc::Sender<MeshState>,
     store: Arc<Store>,
+    pulls: Arc<Pulls>,
     inbound: mpsc::Receiver<Connection>,
 }
 
@@ -429,6 +447,7 @@ impl PeerTask {
         tasks.spawn(run_fetcher(
             conn.clone(),
             self.clip.clone(),
+            self.pulls.clone(),
             self.name.clone(),
             inbox,
         ));
@@ -500,7 +519,7 @@ impl PeerTask {
             }
 
             let served = match ask {
-                Ask::Clip => send_clip(send, clip.clip()).await,
+                Ask::Clip => send_clip(send, &clip.encoded()).await,
                 Ask::Contents(requests) => send_contents(send, &store, &requests).await,
             };
             if let Err(err) = served {
@@ -560,9 +579,10 @@ async fn send_contents(
     Ok(())
 }
 
-/// Sends our clip to a peer that asked for it.
-async fn send_clip(mut send: SendStream, clip: Option<Arc<Clip>>) -> eyre::Result<()> {
-    write_message(&mut send, &clip, proto::MAX_CLIP_SIZE).await?;
+/// Sends our clip, encoded as an `Option<Clip>`, to a peer that asked for
+/// it.
+async fn send_clip(mut send: SendStream, clip: &[u8]) -> eyre::Result<()> {
+    write_encoded(&mut send, clip, proto::MAX_CLIP_SIZE).await?;
     send.finish()?;
 
     Ok(())
@@ -613,17 +633,23 @@ async fn run_sender(
 /// Pulls from one peer whenever it announces a newer clip than ours.
 ///
 /// One at a time: heads announced meanwhile collapse into the newest, which
-/// is checked again after the pull. A failed pull is not retried here: the
-/// peer's next announcement, or the periodic one, comes back to it.
+/// is checked again after the pull. A clip another peer is sending already
+/// is waited for rather than asked for twice. A failed pull is not retried
+/// here: the peer's next announcement, or the periodic one, comes back to
+/// it.
 async fn run_fetcher(
     conn: Connection,
     clip: Arc<ClipService>,
+    pulls: Arc<Pulls>,
     name: String,
     mut heads: watch::Receiver<Option<Stamp>>,
 ) {
     while heads.changed().await.is_ok() {
-        let head = *heads.borrow_and_update();
-        if head <= clip.head() {
+        let Some(head) = *heads.borrow_and_update() else {
+            continue;
+        };
+        let _pull = pulls.claim(head).await;
+        if Some(head) <= clip.head() {
             continue;
         }
 
@@ -637,6 +663,27 @@ async fn run_fetcher(
             Ok(Err(err)) => tracing::debug!(peer = %name, "cannot fetch: {err:#}"),
             Err(_) => tracing::debug!(peer = %name, "fetch timed out"),
         }
+    }
+}
+
+impl Pulls {
+    /// Claims the pull of the clip stamped `stamp`, waiting while another
+    /// peer's pull of it is under way.
+    async fn claim(&self, stamp: Stamp) -> Pull<'_> {
+        loop {
+            let done = self.done.notified();
+            if self.stamps.lock().unwrap().insert(stamp) {
+                return Pull { pulls: self, stamp };
+            }
+            done.await;
+        }
+    }
+}
+
+impl Drop for Pull<'_> {
+    fn drop(&mut self) {
+        self.pulls.stamps.lock().unwrap().remove(&self.stamp);
+        self.pulls.done.notify_waiters();
     }
 }
 
@@ -659,5 +706,34 @@ async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Option<Conne
             tracing::debug!(peer = %name, "cannot connect: {err:#}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A clip is pulled from one peer at a time, and only that clip waits.
+    #[tokio::test]
+    async fn a_clip_is_pulled_once_at_a_time() {
+        let origin = iroh::SecretKey::generate().public();
+        let (one, two) = (Stamp { millis: 1, origin }, Stamp { millis: 2, origin });
+        let pulls = Pulls::default();
+
+        let first = pulls.claim(one).await;
+        let _other = tokio::time::timeout(Duration::from_secs(1), pulls.claim(two))
+            .await
+            .expect("another clip does not wait");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pulls.claim(one))
+                .await
+                .is_err(),
+            "the same clip waits",
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), pulls.claim(one))
+            .await
+            .expect("and gets its turn once the first is done");
     }
 }

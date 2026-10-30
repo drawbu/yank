@@ -19,7 +19,7 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -35,7 +35,7 @@ use super::{
 use crate::{
     clip::{
         Captured, Clip, Clipboard, Effect, Pause, Payload, Policy, Rep, Saved, Selection, Stamp,
-        Switch,
+        Switch, WeakPayload,
         backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, read_existing, write_private},
@@ -60,6 +60,8 @@ pub struct ClipService {
     dirs: Dirs,
     settings: Arc<Settings>,
     board: Mutex<Clipboard>,
+    /// The clip as peers pull it.
+    encoded: Mutex<Encoded>,
     /// The compositor connection, or why there is none.
     backend: Mutex<Result<Platform, String>>,
     /// The stamp of the clip, for the peers to announce.
@@ -73,6 +75,15 @@ pub struct ClipService {
     /// Woken when a clip's files have been laid out here, for whoever is
     /// waiting on them.
     arrived: Notify,
+}
+
+/// The clip encoded once for every pull in flight rather than once per
+/// peer, and dropped with the last of them; and the clip it was encoded
+/// from, so a newer one is never served stale.
+#[derive(Debug, Default)]
+struct Encoded {
+    from: Weak<Clip>,
+    bytes: WeakPayload,
 }
 
 /// Where the clip's files are.
@@ -100,6 +111,7 @@ impl ClipService {
             dirs: dirs.clone(),
             settings,
             board: Mutex::new(board),
+            encoded: Mutex::default(),
             backend: Mutex::new(Err("starting".to_owned())),
             head,
             jobs,
@@ -122,9 +134,25 @@ impl ClipService {
         self.head.subscribe()
     }
 
-    /// The clip, for a peer that asked for it.
-    pub fn clip(&self) -> Option<Arc<Clip>> {
-        self.board.lock().unwrap().clip().cloned()
+    /// The clip, encoded as an `Option<Clip>`, for a peer that asked for
+    /// it.
+    pub fn encoded(&self) -> Payload {
+        let clip = self.board.lock().unwrap().clip().cloned();
+        let mut encoded = self.encoded.lock().unwrap();
+        if let Some(clip) = &clip
+            && std::ptr::eq(encoded.from.as_ptr(), Arc::as_ptr(clip))
+            && let Some(bytes) = encoded.bytes.upgrade()
+        {
+            return bytes;
+        }
+
+        let bytes = Payload::from(postcard::to_stdvec(&clip).expect("a clip must serialize"));
+        *encoded = Encoded {
+            from: clip.as_ref().map_or_else(Weak::new, Arc::downgrade),
+            bytes: bytes.downgrade(),
+        };
+
+        bytes
     }
 
     /// Takes a clip from a peer.

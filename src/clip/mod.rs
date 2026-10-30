@@ -12,7 +12,7 @@ pub mod wayland;
 
 pub use backend::{Captured, Policy, Serve};
 pub use copy::{Clip, Copy, Rep, Selection};
-pub use payload::Payload;
+pub use payload::{Payload, WeakPayload};
 pub use stamp::Stamp;
 pub use state::{Clipboard, Effect, Pause, Saved, Switch};
 
