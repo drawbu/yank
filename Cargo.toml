@@ -16,7 +16,7 @@ eyre = "0.6"
 data-encoding = "2.11"
 etcetera = "0.11"
 humantime = "2.4"
-iroh = "1.4"
+iroh = { version = "1.4", default-features = false, features = ["fast-apple-datapath", "portmapper", "tls-ring"] }
 percent-encoding = "2.3"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 rand = "0.10"
@@ -32,10 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
 zeroize = "1.9"
 
-# The Wayland backend and the session lookup that serves it, and nothing
-# else, need these. Kept apart so a build for another platform fails on
-# the backend it is missing rather than on a Wayland binding it could
-# never have used.
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
@@ -46,5 +42,7 @@ zbus = { version = "6.1", default-features = false, features = ["proxy", "tokio"
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
 strip = true
