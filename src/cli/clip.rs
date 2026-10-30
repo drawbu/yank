@@ -1,9 +1,10 @@
 //! The clipboard commands.
 
 use std::{
+    collections::BTreeSet,
     fs,
     io::{IsTerminal as _, Read as _, Write as _},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -146,11 +147,22 @@ pub fn get(args: &GetArgs, dirs: &Dirs) -> eyre::Result<()> {
     };
     let tree = PathBuf::from(tree);
 
-    // Checked before anything is written, so a collision halfway through
-    // does not leave half a copy behind.
-    for file in &files {
-        let to = args.to.join(&file.path);
-        eyre::ensure!(!to.exists(), "{} is already there", to.display());
+    // Each top-level entry must be new, a dangling link included: the paths
+    // are a peer's, and writing into a folder already here
+    // (`.config/autostart`) or through a link would put files where the
+    // peer chose. Checked before anything is written, so a collision leaves
+    // no half copy behind.
+    let tops: BTreeSet<_> = files
+        .iter()
+        .filter_map(|file| Path::new(&file.path).components().next())
+        .collect();
+    for top in tops {
+        let to = args.to.join(top);
+        eyre::ensure!(
+            to.symlink_metadata().is_err(),
+            "{} is already there",
+            to.display(),
+        );
     }
     for file in &files {
         let (from, to) = (tree.join(&file.path), args.to.join(&file.path));
