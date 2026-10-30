@@ -28,7 +28,8 @@ pub const MAX_MESH_PEERS: usize = 64;
 /// Cap on a record's version. Versions advance by one per local change, so
 /// a record past this is corrupt or hostile: without the cap, a record
 /// parked at `u64::MAX` could never be superseded, freezing a machine out
-/// of the mesh for good.
+/// of the mesh for good. A tombstone may reach it, and is final there: a
+/// record pinned just under the cap can still be removed everywhere.
 const MAX_RECORD_VERSION: u64 = 1 << 32;
 
 /// This machine's copy of the mesh.
@@ -198,14 +199,15 @@ impl MeshState {
     /// the risk of a peer editing our identity.
     pub fn merge(&mut self, remote: &MeshState, local: &EndpointId) {
         for (id, record) in &remote.peers {
-            // Strictly below the ceiling: a record *at* it could never be
-            // superseded by a local change.
-            if id == local || record.version >= MAX_RECORD_VERSION {
-                continue;
-            }
-            if let PeerStatus::Alive { name } = &record.status
-                && validate_name(name).is_err()
-            {
+            // Nothing alive at the ceiling, where a local change could never
+            // supersede it, and nothing past it.
+            let valid = match &record.status {
+                PeerStatus::Alive { name } => {
+                    record.version < MAX_RECORD_VERSION && validate_name(name).is_ok()
+                }
+                PeerStatus::Removed => record.version <= MAX_RECORD_VERSION,
+            };
+            if id == local || !valid {
                 continue;
             }
 
@@ -254,6 +256,23 @@ mod tests {
         MeshState {
             peers: BTreeMap::from([(id, Peer { version, status })]),
         }
+    }
+
+    /// A machine pinned just under the ceiling can still be removed, and
+    /// the removal spreads.
+    #[test]
+    fn a_removal_at_the_ceiling_spreads() {
+        let (local, remover, peer) = (endpoint(), endpoint(), endpoint());
+        let pinned = membership(peer, MAX_RECORD_VERSION - 1, Some("pinned"));
+        let mut state = MeshState::default();
+        state.merge(&pinned, &local);
+
+        let mut theirs = MeshState::default();
+        theirs.merge(&pinned, &remover);
+        theirs.remove_peer(&peer).unwrap();
+        state.merge(&theirs, &local);
+
+        assert_eq!(state.peer_name(&peer), None);
     }
 
     #[test]
