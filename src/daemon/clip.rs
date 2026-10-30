@@ -34,7 +34,8 @@ use super::{
 };
 use crate::{
     clip::{
-        Captured, Clip, Clipboard, Effect, Pause, Policy, Rep, Saved, Selection, Stamp, Switch,
+        Captured, Clip, Clipboard, Effect, Pause, Payload, Policy, Rep, Saved, Selection, Stamp,
+        Switch,
         backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, read_existing, write_private},
@@ -266,7 +267,7 @@ impl ClipService {
     /// asked for.
     ///
     /// Returns the type of the bytes, and the other types it carries.
-    pub fn paste(&self, mime: Option<&str>) -> eyre::Result<(String, Vec<String>, Vec<u8>)> {
+    pub fn paste(&self, mime: Option<&str>) -> eyre::Result<(String, Vec<String>, Payload)> {
         let board = self.board.lock().unwrap();
         let selection = &board
             .current()

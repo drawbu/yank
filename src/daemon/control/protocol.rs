@@ -11,7 +11,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    clip::{Pause, Switch},
+    clip::{Pause, Payload, Switch},
     files::FileRef,
 };
 
@@ -48,6 +48,7 @@ pub enum Request {
     /// Put something on the clipboard of every machine.
     Copy {
         mime: String,
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
         secret: bool,
         ttl: Option<Duration>,
@@ -108,7 +109,7 @@ pub enum Response {
         mime: String,
         /// The other types the clipboard carries.
         alternates: Vec<String>,
-        bytes: Vec<u8>,
+        bytes: Payload,
     },
     /// The files the clipboard names, and where they are.
     Files {

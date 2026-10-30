@@ -4093,6 +4093,7 @@ dependencies = [
  "rand",
  "rustix",
  "serde",
+ "serde_bytes",
  "serde_json",
  "subtle",
  "tempfile",

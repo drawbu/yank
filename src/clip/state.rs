@@ -25,7 +25,6 @@ use std::{
 
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 
 use super::{
     Clip, Copy, Rep, Selection, Stamp,
@@ -237,11 +236,12 @@ impl Clipboard {
         // a restart, or after an application re-announced what we
         // applied. The first representation is enough to tell: it is the
         // one such an application announces it under.
-        let primary = Hash::of(&selection.primary.bytes);
         if let Some(clip) = &self.clip
             && let Some(copy) = &clip.copy
-            && (self.served == Some(primary)
-                || copy.selection.primary.bytes == selection.primary.bytes)
+            && (copy.selection.primary.bytes == selection.primary.bytes
+                || self
+                    .served
+                    .is_some_and(|served| served == Hash::of(&selection.primary.bytes)))
         {
             self.applied = Some(clip.stamp);
             return Vec::new();
@@ -465,7 +465,10 @@ fn stripped(copy: &Copy) -> Selection {
         .bytes
         .clone();
 
-    Selection::of(Rep::new(mime::PLAIN_TEXT, bytes))
+    Selection::of(Rep {
+        mime: mime::PLAIN_TEXT.to_owned(),
+        bytes,
+    })
 }
 
 /// The selection, naming the copies of its files that are on this
@@ -507,7 +510,7 @@ fn serves(selection: &Selection) -> Vec<Serve> {
         }
         serves.push(Serve {
             mimes,
-            bytes: Arc::new(Zeroizing::new(rep.bytes.clone())),
+            bytes: rep.bytes.clone(),
         });
     }
 
@@ -601,6 +604,34 @@ mod tests {
         assert!(board.head().is_some());
         assert!(applied(&effects).is_empty());
         assert_eq!(current(&board).as_deref(), Some("typed elsewhere"));
+    }
+
+    /// What we served for a peer's paths is their text, not the copy's
+    /// own first representation: an application announcing it back is not
+    /// a new copy.
+    #[test]
+    fn a_peers_paths_coming_back_are_not_a_new_copy() {
+        let mut peer = clipboard();
+        let paths = Selection::new(vec![
+            Rep::new(
+                mime::GNOME_COPIED_FILES,
+                b"copy\nfile:///home/x/y.iso".to_vec(),
+            ),
+            Rep::new(mime::URI_LIST, b"file:///home/x/y.iso".to_vec()),
+        ])
+        .unwrap();
+        peer.copy(paths, Vec::new(), false, None).unwrap();
+
+        let mut board = clipboard();
+        let (_, text) = served(&board.accept(pulled(&peer)).unwrap()).remove(0);
+        let head = board.head();
+
+        assert!(
+            board
+                .captured(captured(&text, false), Vec::new())
+                .is_empty()
+        );
+        assert_eq!(board.head(), head);
     }
 
     #[test]

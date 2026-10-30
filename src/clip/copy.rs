@@ -3,13 +3,16 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize as _;
 
-use super::{MAX_SIZE, Stamp, mime};
+use super::{MAX_SIZE, Payload, Stamp, mime};
 use crate::files::{self, FileRef};
 
 /// How much of a copy [`Copy::preview`] keeps.
 const PREVIEW_CHARS: usize = 72;
+
+/// How much of a copy [`Copy::preview`] reads: a preview is one line, and a
+/// copy can be megabytes of it.
+const PREVIEW_SCAN: usize = 16 * 1024;
 
 /// What a file adds to a copy on the wire besides its path: its hash, its
 /// size and the length prefixes.
@@ -74,7 +77,7 @@ pub struct Selection {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rep {
     pub mime: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Payload,
 }
 
 impl Selection {
@@ -194,7 +197,7 @@ impl Copy {
             return format!("<{mime}, {}>", bytesize::ByteSize::b(bytes.len() as u64));
         }
 
-        let text = String::from_utf8_lossy(bytes);
+        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_SCAN)]);
         let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
         let mut preview = crate::config::sanitize(lines.next().unwrap_or(""));
         if let Some((cut, _)) = preview.char_indices().nth(PREVIEW_CHARS) {
@@ -213,15 +216,8 @@ impl Rep {
     pub fn new(mime: impl Into<String>, bytes: Vec<u8>) -> Self {
         Rep {
             mime: mime.into(),
-            bytes,
+            bytes: bytes.into(),
         }
-    }
-}
-
-impl Drop for Rep {
-    /// Wipes the bytes: the clipboard is where a copied password lives.
-    fn drop(&mut self) {
-        self.bytes.zeroize();
     }
 }
 

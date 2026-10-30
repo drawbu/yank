@@ -127,7 +127,7 @@ impl Machine {
 
     async fn paste(&self) -> eyre::Result<Vec<u8>> {
         match self.ask(&Request::Paste { mime: None }).await? {
-            Response::Contents { bytes, .. } => Ok(bytes),
+            Response::Contents { bytes, .. } => Ok(bytes.to_vec()),
             other => eyre::bail!("unexpected answer: {other:?}"),
         }
     }

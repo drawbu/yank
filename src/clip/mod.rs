@@ -4,6 +4,7 @@
 pub mod backend;
 mod copy;
 pub mod mime;
+mod payload;
 mod stamp;
 mod state;
 #[cfg(target_os = "linux")]
@@ -11,6 +12,7 @@ pub mod wayland;
 
 pub use backend::{Captured, Policy, Serve};
 pub use copy::{Clip, Copy, Rep, Selection};
+pub use payload::Payload;
 pub use stamp::Stamp;
 pub use state::{Clipboard, Effect, Pause, Saved, Switch};
 
