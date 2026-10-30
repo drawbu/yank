@@ -36,7 +36,7 @@ use std::{
 
 use eyre::WrapErr as _;
 use iroh::{
-    Endpoint, EndpointId, TransportAddr,
+    Endpoint, EndpointId, TransportAddr, Watcher as _,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use tokio::{
@@ -74,7 +74,16 @@ const ANTI_ENTROPY: Duration = Duration::from_mins(5);
 /// Delay before redialing after a first failure; doubles up to the
 /// ceiling.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_mins(1);
+
+/// Ceiling of that delay. It can be long, since each attempt at an absent
+/// machine is a lookup on the discovery servers: a machine coming back dials
+/// us itself, and our own network changing cuts the wait short.
+const BACKOFF_MAX: Duration = Duration::from_mins(10);
+
+/// How long a wait lasts before a change of our own addresses cuts it
+/// short. Behind some NATs they change every few seconds, and this bounds
+/// how often that redials an absent machine.
+const ADDR_CHANGE_GRACE: Duration = Duration::from_mins(1);
 
 /// A connection that lasted this long resets the delay. Connections dying
 /// younger (closed as a duplicate, or a machine that keeps flapping)
@@ -324,18 +333,26 @@ struct PeerTask {
 async fn run_peer(mut task: PeerTask) {
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
     let mut delay = None;
+    // Kept across attempts, so a change during a dial is not missed.
+    let mut addr = task.endpoint.watch_addr();
 
     loop {
         // Wait out the delay, but take an incoming connection if the peer
-        // dials us first.
+        // dials us first, and try again early when our own addresses
+        // change: what failed on the old network may work on the new one.
         let mut adopted = None;
         if let Some(delay) = delay.take() {
             task.set_state(PeerState::Backoff {
                 until: Instant::now() + delay,
             });
+            let moved = async {
+                tokio::time::sleep(ADDR_CHANGE_GRACE).await;
+                addr.updated().await
+            };
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 Some(conn) = task.inbound.recv() => adopted = Some((conn, false)),
+                Ok(_) = moved => {}
             }
         }
 

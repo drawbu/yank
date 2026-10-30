@@ -18,5 +18,11 @@ pub fn run(dirs: &Dirs) -> eyre::Result<()> {
         )
         .init();
 
-    tokio::runtime::Runtime::new()?.block_on(daemon::run(dirs))
+    // Two workers: a clipboard needs no more, and each keeps a malloc arena
+    // of freed buffers.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?
+        .block_on(daemon::run(dirs))
 }
