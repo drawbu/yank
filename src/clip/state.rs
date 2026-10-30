@@ -89,8 +89,9 @@ pub struct Clipboard {
     /// still there, so we neither put it on again nor mistake it for
     /// something the user copied.
     applied: Option<Stamp>,
-    /// What its first representation was, which for a peer's files is not
-    /// the clip's own: an application re-announcing it is not a new copy.
+    /// What the clip's first representation was when served, which for a
+    /// peer's files is not the clip's own: an application re-announcing it
+    /// is not a new copy.
     served: Option<Hash>,
     /// Where the clip's files are laid out here, once they are. Until then
     /// its paths are another machine's, and are offered as text.
@@ -364,6 +365,7 @@ impl Clipboard {
             let ttl = Duration::from_secs(u64::from(copy.ttl?));
             Some(clip.stamp.time().min(now) + ttl)
         });
+        self.served = None;
         self.tree = None;
         self.clip = Some(clip);
     }
@@ -390,7 +392,16 @@ impl Clipboard {
                 }
                 let carried = self.carried(copy);
                 self.served = Some(Hash::of(&carried.primary.bytes));
-                effects.push(Effect::Backend(Command::Offer(serves(&carried))));
+                let mut offered = serves(&carried);
+                // Tells clipboard managers here to keep it out of their
+                // history.
+                if copy.secret {
+                    offered.push(Serve {
+                        mimes: vec![mime::SECRET_HINT.to_owned()],
+                        bytes: b"secret".to_vec().into(),
+                    });
+                }
+                effects.push(Effect::Backend(Command::Offer(offered)));
 
                 effects
             }
@@ -632,6 +643,41 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(board.head(), head);
+    }
+
+    /// A password manager's copy stays a secret on every machine: a
+    /// lifetime, never saved, and offered as one, so clipboard managers
+    /// there keep it out of their history.
+    #[test]
+    fn a_password_managers_copy_stays_a_secret() {
+        let mut peer = clipboard();
+        peer.captured(captured("hunter2", true), Vec::new());
+
+        let mut board = clipboard();
+        let offered = served(&board.accept(pulled(&peer)).unwrap());
+        assert!(
+            offered
+                .iter()
+                .any(|(mimes, _)| mimes == &[mime::SECRET_HINT])
+        );
+        assert!(board.expires_at().is_some());
+        assert!(board.saved().clip.unwrap().copy.is_none());
+    }
+
+    /// What was served for an older clip says nothing about the current
+    /// one: copying it again here is a copy.
+    #[test]
+    fn copying_again_what_was_served_before_is_a_copy() {
+        let mut peer = clipboard();
+        copy(&mut peer, "hello");
+        let mut board = clipboard();
+        board.accept(pulled(&peer)).unwrap();
+
+        board.captured(captured("world", false), Vec::new());
+        let effects = board.captured(captured("hello", false), Vec::new());
+
+        assert!(!effects.is_empty());
+        assert_eq!(current(&board).as_deref(), Some("hello"));
     }
 
     #[test]

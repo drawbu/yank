@@ -247,17 +247,31 @@ impl ClipService {
     }
 
     /// Records a selection the compositor reported, with the files it
-    /// named once they are spooled. Dropped when the clip moved on since
-    /// `base` was read: spooling takes time, and a copy made elsewhere
-    /// meanwhile is the later one.
-    pub fn record(&self, base: Option<Stamp>, captured: Captured, files: Vec<FileRef>) {
+    /// named once they are spooled, and returns the clip it leaves, `None`
+    /// when dropped.
+    ///
+    /// Dropped when another copy replaced the clip since `base` was read:
+    /// spooling takes time, and that copy is the later one. The clip the
+    /// previous record made, `recorded`, does not count: this one was
+    /// queued behind it.
+    pub fn record(
+        &self,
+        base: Option<Stamp>,
+        recorded: Option<Stamp>,
+        captured: Captured,
+        files: Vec<FileRef>,
+    ) -> Option<Stamp> {
+        let mut head = None;
         self.change(|board| {
-            if board.head() == base {
-                board.captured(captured, files)
-            } else {
-                Vec::new()
+            if board.head() != base && board.head() != recorded {
+                return Vec::new();
             }
+            let effects = board.captured(captured, files);
+            head = board.head();
+            effects
         });
+
+        head
     }
 
     /// Records that the files of the clip stamped `stamp` are here now.

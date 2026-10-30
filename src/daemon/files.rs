@@ -115,6 +115,9 @@ pub async fn run(
     // a transfer holds up nothing else.
     let mut fetch: Option<(Stamp, JoinHandle<()>)> = None;
 
+    // The clip the last record made, which the next one was queued behind.
+    let mut recorded = None;
+
     while let Some(job) = jobs.recv().await {
         match job {
             Job::Record {
@@ -132,7 +135,7 @@ pub async fn run(
                         Vec::new()
                     })
                 };
-                clip.record(base, *captured, files);
+                recorded = clip.record(base, recorded, *captured, files);
             }
             Job::Copy { paths, ttl, done } => {
                 let copied = match spool(&store, &settings, paths.clone()).await {
