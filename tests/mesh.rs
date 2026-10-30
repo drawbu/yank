@@ -383,6 +383,23 @@ async fn a_secret_reaches_the_other_machine_but_not_its_disk() -> eyre::Result<(
     Ok(())
 }
 
+/// A machine alone keeps its clipboard across a restart: nothing but its
+/// own disk can give it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_keeps_the_clipboard() -> eyre::Result<()> {
+    let mut machine = Machine::start(&MemoryLookup::default()).await?;
+
+    machine.copy("before the restart").await?;
+    machine.restart().await?;
+
+    assert_eq!(
+        machine.current().await?.as_deref(),
+        Some("before the restart")
+    );
+
+    Ok(())
+}
+
 /// A machine that was away gets the latest clip from one that restarted
 /// since, which has to announce what it holds without waiting for a new
 /// copy, and must not bring an older one back.

@@ -396,10 +396,19 @@ impl ClipService {
         }
     }
 
+    /// Writes the clipboard straight to the file: buffering it whole first
+    /// would be one more copy of what may be megabytes. The write blocks on
+    /// the disk, so the runtime hands this worker's other tasks to another.
     fn save(&self, board: &Clipboard) -> eyre::Result<()> {
-        let bytes = postcard::to_stdvec(&board.saved()).expect("the clipboard must serialize");
+        use std::io::Write as _;
 
-        write_private(&self.dirs.clip_file(), &bytes)
+        tokio::task::block_in_place(|| {
+            write_private(&self.dirs.clip_file(), |file| {
+                let mut out = postcard::to_io(&board.saved(), std::io::BufWriter::new(file))
+                    .map_err(std::io::Error::other)?;
+                out.flush()
+            })
+        })
     }
 
     /// Connects to the compositor.

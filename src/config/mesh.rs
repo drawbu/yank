@@ -97,9 +97,9 @@ impl MeshState {
     /// Writes `mesh.json` atomically: a crash mid-write must not cost the
     /// user every pairing.
     pub fn save(&self, dirs: &Dirs) -> eyre::Result<()> {
-        let path = dirs.mesh_file();
-        let text = serde_json::to_vec_pretty(self).expect("mesh state must serialize");
-        write_private(&path, &text)
+        write_private(&dirs.mesh_file(), |file| {
+            serde_json::to_writer_pretty(file, self).map_err(Into::into)
+        })
     }
 
     /// The machines currently in the mesh, with their names.

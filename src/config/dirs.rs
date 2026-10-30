@@ -128,11 +128,14 @@ pub fn create_private(path: &Path) -> eyre::Result<()> {
         .wrap_err_with(|| format!("cannot create {}", path.display()))
 }
 
-/// Writes a file atomically and owner-only, by writing a sibling and
-/// renaming it into place: a crash mid-write must never leave a truncated
-/// file where a valid one was.
-pub fn write_private(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
-    use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
+/// Writes a file atomically and owner-only, by having `contents` write a
+/// sibling and renaming it into place: a crash mid-write must never leave a
+/// truncated file where a valid one was.
+pub fn write_private(
+    path: &Path,
+    contents: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> eyre::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     let tmp = path.with_extension("tmp");
     let write = || -> std::io::Result<()> {
@@ -142,7 +145,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.write_all(bytes)?;
+        contents(&mut file)?;
         file.sync_all()
     };
 
