@@ -8,8 +8,8 @@
 //!   on the mesh. Only the daemon ever reads it.
 //! - `$XDG_STATE_HOME/yank/mesh.json`: the paired machines. The daemon is
 //!   the sole writer; the CLI mutates it through the control socket.
-//! - `$XDG_STATE_HOME/yank/clip.bin`: the clipboard and the pause, as last
-//!   saved, secrets left out.
+//! - `$XDG_STATE_HOME/yank/clip.bin`: the clipboard, as last saved, secrets
+//!   left out.
 //! - `$XDG_STATE_HOME/yank/files/`: the spool of copied files, see
 //!   [`crate::files`].
 //! - `$XDG_RUNTIME_DIR/yank.sock`: the control socket.

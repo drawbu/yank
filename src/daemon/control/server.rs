@@ -211,9 +211,6 @@ async fn answer(ctx: &Context, request: Request) -> eyre::Result<Response> {
 
             Ok(Response::Done)
         }
-        Request::SetPause { capture, apply } => {
-            Ok(Response::Paused(clip.set_pause(capture, apply)))
-        }
     }
 }
 
@@ -242,7 +239,6 @@ fn status(ctx: &Context) -> Status {
                 .clip
                 .backend_down()
                 .map(|reason| sanitize_bounded(&reason)),
-            pause: ctx.clip.pause(),
             current: ctx.clip.describe(name),
         },
         peers: ctx.peers.statuses(),

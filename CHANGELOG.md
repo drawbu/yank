@@ -23,6 +23,9 @@ latest copy made anywhere on the mesh, and nothing else.
 ### Removed
 
 - `yank list`, `yank pick`, `yank rm` and `yank clear --history`.
+- `yank pause` and `yank resume`, along with a pause in effect: everything is
+  shared again after upgrading. Set `capture` or `apply` to `false` in
+  `config.toml` to stop a direction.
 - The `history-limit`, `history-budget` and `file-budget` settings. A
   `config.toml` still setting them is refused, and the daemon falls back to
   the defaults.

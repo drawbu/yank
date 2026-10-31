@@ -10,10 +10,7 @@ use std::time::Duration;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    clip::{Pause, Payload, Switch},
-    files::FileRef,
-};
+use crate::{clip::Payload, files::FileRef};
 
 /// Cap on a control message. Sized for the largest one, a copy at the
 /// protocol ceiling.
@@ -66,11 +63,6 @@ pub enum Request {
     Files,
     /// Empty the clipboard everywhere.
     Clear,
-    /// Stop a direction of the clipboard, or start it again.
-    SetPause {
-        capture: Option<Switch>,
-        apply: Option<Switch>,
-    },
 }
 
 impl Request {
@@ -118,7 +110,6 @@ pub enum Response {
         tree: Option<String>,
         files: Vec<FileRef>,
     },
-    Paused(Pause),
     /// The request failed. The message is already safe to print.
     Error(String),
 }
@@ -140,7 +131,6 @@ pub struct Status {
 pub struct ClipboardStatus {
     /// Whether the compositor side is up, and why not when it is not.
     pub backend: Option<String>,
-    pub pause: Pause,
     /// What the clipboard holds, mesh-wide.
     pub current: Option<ClipInfo>,
 }

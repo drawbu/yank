@@ -24,7 +24,6 @@ use std::{
 };
 
 use iroh::EndpointId;
-use serde::{Deserialize, Serialize};
 
 use super::{
     Clip, Copy, Rep, Selection, Stamp,
@@ -48,33 +47,6 @@ pub enum Effect {
     Fetch(Stamp),
 }
 
-/// Whether a direction of the clipboard is running.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Switch {
-    #[default]
-    On,
-    /// Off, until the given time or until `yank resume`.
-    Paused { until: Option<SystemTime> },
-}
-
-/// Which directions of the clipboard are running.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pause {
-    /// Sharing what is copied here.
-    pub capture: Switch,
-    /// Putting what others copied on this clipboard.
-    pub apply: Switch,
-}
-
-/// What survives a restart. A secret is saved as a clear: its stamp, so a
-/// restart cannot bring an older clip back, and none of its bytes.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct Saved {
-    pub clip: Option<Arc<Clip>>,
-    pub pause: Pause,
-}
-
 /// The clipboard of this machine.
 #[derive(Debug)]
 pub struct Clipboard {
@@ -86,8 +58,7 @@ pub struct Clipboard {
     /// When the copy disappears, if it has a lifetime.
     expires: Option<SystemTime>,
     /// The clip we last put on the local clipboard, whether or not it is
-    /// still there, so we neither put it on again nor mistake it for
-    /// something the user copied.
+    /// still there: what there is to empty once it goes.
     applied: Option<Stamp>,
     /// What the clip's first representation was when served, which for a
     /// peer's files is not the clip's own: an application re-announcing it
@@ -96,25 +67,13 @@ pub struct Clipboard {
     /// Where the clip's files are laid out here, once they are. Until then
     /// its paths are another machine's, and are offered as text.
     tree: Option<PathBuf>,
-    pause: Pause,
-}
-
-impl Switch {
-    /// Whether the direction is running at `now`, a paused-until having
-    /// elapsed counting as running.
-    pub fn is_on(self, now: SystemTime) -> bool {
-        match self {
-            Switch::On => true,
-            Switch::Paused { until } => until.is_some_and(|until| now >= until),
-        }
-    }
 }
 
 impl Clipboard {
     /// Resumes from what was saved. Nothing reaches the clipboard for it:
     /// what the session holds is the compositor's to report, and it may be
     /// something copied while the daemon was down.
-    pub fn new(origin: EndpointId, settings: Arc<Settings>, saved: Saved) -> Self {
+    pub fn new(origin: EndpointId, settings: Arc<Settings>, saved: Option<Arc<Clip>>) -> Self {
         let mut board = Clipboard {
             origin,
             settings,
@@ -123,31 +82,27 @@ impl Clipboard {
             applied: None,
             served: None,
             tree: None,
-            pause: saved.pause,
         };
-        if let Some(clip) = saved.clip {
+        if let Some(clip) = saved {
             board.set(clip);
-            let _ = board.expire(SystemTime::now());
-            board.applied = board.current().map(|(stamp, _)| stamp);
+            board.lapse(SystemTime::now());
+            // Remembered as applied, to recognize it when reported back.
+            let _ = board.apply();
         }
 
         board
     }
 
-    /// What to write to disk.
-    pub fn saved(&self) -> Saved {
-        let clip = self.clip.as_ref().map(|clip| match &clip.copy {
+    /// What to write to disk. A secret is saved as a clear: its stamp, so a
+    /// restart cannot bring an older clip back, and none of its bytes.
+    pub fn saved(&self) -> Option<Arc<Clip>> {
+        self.clip.as_ref().map(|clip| match &clip.copy {
             Some(copy) if copy.secret => Arc::new(Clip {
                 stamp: clip.stamp,
                 copy: None,
             }),
             _ => clip.clone(),
-        });
-
-        Saved {
-            clip,
-            pause: self.pause,
-        }
+        })
     }
 
     pub fn clip(&self) -> Option<&Arc<Clip>> {
@@ -164,10 +119,6 @@ impl Clipboard {
         let clip = self.clip.as_ref()?;
 
         Some((clip.stamp, clip.copy.as_ref()?))
-    }
-
-    pub fn pause(&self) -> Pause {
-        self.pause
     }
 
     /// Whether the clip was made on this machine. The stamp is a peer's
@@ -214,7 +165,7 @@ impl Clipboard {
         copy.check()?;
 
         let mut effects = self.replace(Some(copy));
-        effects.extend(self.reconcile(SystemTime::now()));
+        effects.extend(self.apply());
 
         Ok(effects)
     }
@@ -225,7 +176,7 @@ impl Clipboard {
     /// applied: putting them back would take the selection away from the
     /// application that owns it, for nothing.
     pub fn captured(&mut self, captured: Captured, files: Vec<FileRef>) -> Vec<Effect> {
-        if !self.settings.capture || !self.pause.capture.is_on(SystemTime::now()) {
+        if !self.settings.capture {
             return Vec::new();
         }
         let Some(selection) = self.fit(captured.selection) else {
@@ -282,9 +233,10 @@ impl Clipboard {
         }
 
         self.set(Arc::new(clip));
-        let mut effects = vec![Effect::Save];
         // Its lifetime may have run out on the way.
-        effects.extend(self.expire(SystemTime::now()));
+        self.lapse(SystemTime::now());
+        let mut effects = vec![Effect::Save];
+        effects.extend(self.apply());
 
         Ok(effects)
     }
@@ -292,43 +244,23 @@ impl Clipboard {
     /// Empties the clipboard on every machine.
     pub fn clear(&mut self) -> Vec<Effect> {
         let mut effects = self.replace(None);
-        effects.extend(self.reconcile(SystemTime::now()));
+        effects.extend(self.apply());
 
         effects
     }
 
-    /// Pauses or resumes a direction.
-    pub fn set_pause(&mut self, capture: Option<Switch>, apply: Option<Switch>) -> Vec<Effect> {
-        if let Some(capture) = capture {
-            self.pause.capture = capture;
-        }
-        if let Some(apply) = apply {
-            self.pause.apply = apply;
-        }
-
-        let mut effects = vec![Effect::Save];
-        effects.extend(self.reconcile(SystemTime::now()));
-
-        effects
-    }
-
-    /// Catches up with time: drops the copy once its lifetime has run out,
-    /// and applies what a pause that has lapsed held back.
+    /// Drops the copy once its lifetime has run out.
     ///
     /// Expiry needs no agreement between machines: they all hold the same
     /// clip, so they all drop it at about the same moment without a word.
     /// It works with the network down, which is the point of a lifetime on
     /// a password. The stamp stays, so no older clip comes back.
     pub fn expire(&mut self, now: SystemTime) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        if self.expires.is_some_and(|deadline| now >= deadline)
-            && let Some(clip) = &self.clip
-        {
-            let stamp = clip.stamp;
-            self.set(Arc::new(Clip { stamp, copy: None }));
-            effects.push(Effect::Save);
+        if !self.lapse(now) {
+            return Vec::new();
         }
-        effects.extend(self.reconcile(now));
+        let mut effects = vec![Effect::Save];
+        effects.extend(self.apply());
 
         effects
     }
@@ -340,10 +272,18 @@ impl Clipboard {
             return Vec::new();
         }
         self.tree = Some(tree);
-        // It has to be applied again for the file types to appear.
-        self.applied = None;
+        // Applied again for the file types to appear.
+        self.apply()
+    }
 
-        self.reconcile(SystemTime::now())
+    /// Drops the copy if its lifetime has run out, and says whether it did.
+    fn lapse(&mut self, now: SystemTime) -> bool {
+        let lapsed = self.expires.is_some_and(|deadline| now >= deadline);
+        if lapsed && let Some(stamp) = self.head() {
+            self.set(Arc::new(Clip { stamp, copy: None }));
+        }
+
+        lapsed
     }
 
     /// Makes a new clip from this machine the current one.
@@ -370,9 +310,9 @@ impl Clipboard {
         self.clip = Some(clip);
     }
 
-    /// Brings the local clipboard in line with the clip.
-    fn reconcile(&mut self, now: SystemTime) -> Vec<Effect> {
-        if !self.settings.apply || !self.pause.apply.is_on(now) {
+    /// Brings the local clipboard in line with a clip that just changed.
+    fn apply(&mut self) -> Vec<Effect> {
+        if !self.settings.apply {
             return Vec::new();
         }
         let Some(clip) = &self.clip else {
@@ -380,7 +320,7 @@ impl Clipboard {
         };
 
         match &clip.copy {
-            Some(copy) if self.applied != Some(clip.stamp) => {
+            Some(copy) => {
                 self.applied = Some(clip.stamp);
 
                 // Asked for once, as the clip reaches the clipboard, and
@@ -541,7 +481,7 @@ mod tests {
         Clipboard::new(
             iroh::SecretKey::generate().public(),
             Arc::new(settings),
-            Saved::default(),
+            None,
         )
     }
 
@@ -643,6 +583,13 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(board.head(), head);
+
+        let mut restarted = Clipboard::new(board.origin, board.settings.clone(), board.saved());
+        assert!(
+            restarted
+                .captured(captured(&text, false), Vec::new())
+                .is_empty()
+        );
     }
 
     /// A password manager's copy stays a secret on every machine: a
@@ -661,7 +608,7 @@ mod tests {
                 .any(|(mimes, _)| mimes == &[mime::SECRET_HINT])
         );
         assert!(board.expires_at().is_some());
-        assert!(board.saved().clip.unwrap().copy.is_none());
+        assert!(board.saved().unwrap().copy.is_none());
     }
 
     /// What was served for an older clip says nothing about the current
@@ -678,6 +625,19 @@ mod tests {
 
         assert!(!effects.is_empty());
         assert_eq!(current(&board).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn apply_off_keeps_a_peers_copy_off_the_clipboard() {
+        let mut peer = clipboard();
+        copy(&mut peer, "from the peer");
+        let mut board = with_settings(Settings {
+            apply: false,
+            ..Settings::default()
+        });
+
+        assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
+        assert_eq!(current(&board).as_deref(), Some("from the peer"));
     }
 
     #[test]
@@ -812,13 +772,14 @@ mod tests {
         let mut restarted = Clipboard::new(board.origin, board.settings.clone(), board.saved());
         assert_eq!(current(&restarted).as_deref(), Some("before the restart"));
         assert!(applied(&restarted.expire(SystemTime::now())).is_empty());
-        assert!(applied(&restarted.set_pause(None, None)).is_empty());
     }
 
     #[test]
-    fn pausing_capture_stops_sharing_what_is_copied_here() {
-        let mut board = clipboard();
-        board.set_pause(Some(Switch::Paused { until: None }), None);
+    fn capture_off_shares_nothing() {
+        let mut board = with_settings(Settings {
+            capture: false,
+            ..Settings::default()
+        });
 
         assert!(
             board
@@ -826,23 +787,6 @@ mod tests {
                 .is_empty()
         );
         assert!(board.current().is_none());
-    }
-
-    #[test]
-    fn a_paused_apply_holds_back_until_resumed_or_lapsed() {
-        let mut peer = clipboard();
-        copy(&mut peer, "first");
-
-        let mut board = clipboard();
-        board.set_pause(None, Some(Switch::Paused { until: None }));
-        assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
-        assert_eq!(applied(&board.set_pause(None, Some(Switch::On))), ["first"]);
-
-        copy(&mut peer, "second");
-        let until = SystemTime::now() + Duration::from_hours(1);
-        board.set_pause(None, Some(Switch::Paused { until: Some(until) }));
-        assert!(applied(&board.accept(pulled(&peer)).unwrap()).is_empty());
-        assert_eq!(applied(&board.expire(until)), ["second"]);
     }
 
     /// What a browser copy is: the same selection twice over. Both reach

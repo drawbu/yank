@@ -3,7 +3,6 @@
 mod client;
 mod clip;
 mod daemon;
-mod pause;
 mod peer;
 mod service;
 mod status;
@@ -49,8 +48,6 @@ enum Command {
     Get(clip::GetArgs),
     /// Empty the clipboard on every machine
     Clear,
-    Pause(pause::PauseArgs),
-    Resume(pause::ResumeArgs),
     /// Show the machines, the clipboard and the daemon
     Status,
     Peer(peer::PeerArgs),
@@ -77,8 +74,6 @@ pub fn run() -> eyre::Result<()> {
         Command::Paste(args) => clip::paste(&args, &dirs),
         Command::Get(args) => clip::get(&args, &dirs),
         Command::Clear => clip::clear(&dirs),
-        Command::Pause(args) => pause::pause(&args, &dirs),
-        Command::Resume(args) => pause::resume(&args, &dirs),
         Command::Status => status::run(&dirs),
         Command::Peer(args) => peer::run(args, &dirs),
         Command::Service(args) => service::run(args, &dirs),

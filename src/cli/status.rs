@@ -2,7 +2,7 @@
 
 use super::{
     client::{request, unexpected},
-    pause, ui,
+    ui,
 };
 use crate::{
     config::Dirs,
@@ -37,7 +37,6 @@ fn print(status: &Status) {
             anstream::println!("  {}", ui::warn(format_args!("clipboard down: {reason}")));
         }
     }
-    anstream::println!("  {}", pause::describe(status.clipboard.pause));
 
     anstream::println!("\n{}", ui::heading("Clipboard"));
     match &status.clipboard.current {

@@ -34,8 +34,7 @@ use super::{
 };
 use crate::{
     clip::{
-        Captured, Clip, Clipboard, Effect, Pause, Payload, Policy, Rep, Saved, Selection, Stamp,
-        Switch, WeakPayload,
+        Captured, Clip, Clipboard, Effect, Payload, Policy, Rep, Selection, Stamp, WeakPayload,
         backend::{self, Command, Platform},
     },
     config::{Dirs, Settings, read_existing, write_private},
@@ -49,9 +48,8 @@ const RECONNECT_MIN: Duration = Duration::from_secs(1);
 /// waits this long at worst.
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-/// How often the service loop wakes with nothing due. It is what catches
-/// the things no event announces: a wall clock that jumped over a
-/// lifetime, and a `yank pause --for` whose time is up.
+/// How often the service loop wakes while a copy has a lifetime. It is what
+/// catches a wall clock that jumped over it, which no event announces.
 const EXPIRY_FLOOR: Duration = Duration::from_mins(1);
 
 /// The clipboard, everything it writes to, and everyone it tells.
@@ -69,8 +67,7 @@ pub struct ClipService {
     /// The file service: where a copied file's contents go, and where the
     /// ones a clip names are asked for.
     jobs: Jobs,
-    /// Woken when the state changed in a way the service loop cares about:
-    /// a new lifetime to wait for, or a pause that was lifted.
+    /// Woken when the state changed, for a new lifetime to wait for.
     wake: Notify,
     /// Woken when a clip's files have been laid out here, for whoever is
     /// waiting on them.
@@ -348,13 +345,6 @@ impl ClipService {
         self.change(Clipboard::clear);
     }
 
-    /// Pauses or resumes a direction of the clipboard.
-    pub fn set_pause(&self, capture: Option<Switch>, apply: Option<Switch>) -> Pause {
-        self.change(|board| board.set_pause(capture, apply));
-
-        self.pause()
-    }
-
     /// What the clipboard holds, for `yank status`. `name` names the
     /// machine it was copied on.
     pub fn describe(&self, name: impl Fn(EndpointId) -> String) -> Option<ClipInfo> {
@@ -375,10 +365,6 @@ impl ClipService {
                 .expires_at()
                 .map(|at| at.duration_since(now).unwrap_or_default().as_secs()),
         })
-    }
-
-    pub fn pause(&self) -> Pause {
-        self.board.lock().unwrap().pause()
     }
 
     /// Why the compositor side is not running, `None` when it is.
@@ -568,8 +554,8 @@ pub async fn run(service: Arc<ClipService>) {
     }
 }
 
-/// How long the service loop may sleep: until the lifetime runs out, the
-/// next reconnection attempt, or a minute, whichever comes first.
+/// How long the service loop may sleep: until the lifetime runs out, a
+/// minute at most, or the next reconnection attempt.
 fn next_wake(service: &ClipService, reconnect_at: Option<Instant>) -> Duration {
     // A deadline already in the past means no sleep at all, not a full
     // floor's wait: the copy is due now.
@@ -578,37 +564,38 @@ fn next_wake(service: &ClipService, reconnect_at: Option<Instant>) -> Duration {
         .lock()
         .unwrap()
         .expires_at()
-        .map_or(EXPIRY_FLOOR, |deadline| {
+        .map_or(Duration::MAX, |deadline| {
             deadline
                 .duration_since(SystemTime::now())
                 .unwrap_or_default()
+                .min(EXPIRY_FLOOR)
         });
-    let reconnect = reconnect_at.map_or(EXPIRY_FLOOR, |due| {
+    let reconnect = reconnect_at.map_or(Duration::MAX, |due| {
         due.saturating_duration_since(Instant::now())
     });
 
-    expiry.min(reconnect).min(EXPIRY_FLOOR)
+    expiry.min(reconnect)
 }
 
 /// Reads the saved clipboard. An unreadable one costs the clip, not the
 /// daemon.
-fn load(dirs: &Dirs) -> eyre::Result<Saved> {
+fn load(dirs: &Dirs) -> eyre::Result<Option<Arc<Clip>>> {
     let path = dirs.clip_file();
     let Some(bytes) = read_existing(&path, std::fs::read)? else {
-        return Ok(Saved::default());
+        return Ok(None);
     };
 
     // A file another version wrote may decode into something else
     // entirely; leftover bytes are what gives it away.
-    match postcard::take_from_bytes::<Saved>(&bytes) {
+    match postcard::take_from_bytes::<Option<Arc<Clip>>>(&bytes) {
         Ok((saved, [])) => Ok(saved),
         Ok(_) => {
             tracing::warn!("{} has trailing bytes; starting empty", path.display());
-            Ok(Saved::default())
+            Ok(None)
         }
         Err(err) => {
             tracing::warn!("cannot read {}: {err}; starting empty", path.display());
-            Ok(Saved::default())
+            Ok(None)
         }
     }
 }

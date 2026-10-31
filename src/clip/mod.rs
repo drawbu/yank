@@ -14,7 +14,7 @@ pub use backend::{Captured, Policy, Serve};
 pub use copy::{Clip, Copy, Rep, Selection};
 pub use payload::{Payload, WeakPayload};
 pub use stamp::Stamp;
-pub use state::{Clipboard, Effect, Pause, Saved, Switch};
+pub use state::{Clipboard, Effect};
 
 /// Hard ceiling on one selection, every representation together, enforced
 /// before anything is stored. The user-facing cap in `config.toml` sits

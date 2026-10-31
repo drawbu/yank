@@ -87,7 +87,7 @@ impl Dirs {
         self.state.join("mesh.json")
     }
 
-    /// The clipboard and the pause, as last saved.
+    /// The clipboard, as last saved.
     pub fn clip_file(&self) -> PathBuf {
         self.state.join("clip.bin")
     }

@@ -7,7 +7,6 @@ All the machines connected to your mesh share the same clipboard: whatever
 was copied last, on any of them, is what every one of them pastes.
 
 - Clipboard is shared *almost* instantly.
-- Support pausing/resuming gracefully.
 - Catches up with the latest copy when a machine is off, asleep or offline,
   and comes back.
 - Support copying files
@@ -18,7 +17,6 @@ $ yank status
 This machine 66a7e0c4ab0aa85615819f5257ad995e5b6f1cef3fc6e0bf412e818f7c8ea559
   yank 0.2.0, up for 2h 14m
   clipboard connected
-  Sharing in both directions
 
 Clipboard
   ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample user@host — desktop, 41s ago
@@ -103,8 +101,6 @@ $ yank paste                # print the clipboard, for pipes
 $ yank get                  # write the copied files here
 $ yank clear                # empty every machine's clipboard
 $ yank copy --secret        # gone everywhere in 90 seconds
-$ yank pause [--capture|--apply] [--for 30m]
-$ yank resume
 ```
 
 ## Security and privacy
